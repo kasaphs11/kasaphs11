@@ -2,7 +2,7 @@
 
 Python Developer specialized in **Automation, GUI Applications, and Data Processing**.
 
-I build custom tools that help businesses and organizations save time and reduce manual work.
+I build custom tools that help businesses and organizations save time, reduce manual work, and optimize workflows.
 
 ---
 
@@ -12,14 +12,24 @@ I build custom tools that help businesses and organizations save time and reduce
 - 📊 Excel & Data Processing
 - 🖥️ Python GUI Applications
 - 📄 Reporting Tools
-- 🎮 Game Dev
+- 🎮 Game Development (Logic, Systems, Tools)
+
+---
 
 ## 🛠️ Tech Stack
 
-- Python
-- C, C++, C#
-- Javascript
-  
+- Python (Tkinter, Pandas, OpenPyXL, Automation)
+- C / C++ / C# (Unity and Unreal)
+- JavaScript (Basic Web & Scripting)
+
+---
+
+## 📁 Portfolio
+
+This repository contains real-world production tools and applications.
+
+Game projects and demos are also included.
+
 ---
 
 ## 📬 Contact
