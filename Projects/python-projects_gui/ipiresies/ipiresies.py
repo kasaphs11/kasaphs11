@@ -54,12 +54,19 @@ GREEK_MONTH_ABBR = {
 # -----------------------------
 # Persistence
 # -----------------------------
-def get_state_path() -> str:
+def get_base_dir() -> str:
     if getattr(sys, "frozen", False):
-        base_dir = os.path.dirname(sys.executable)
+        return os.path.dirname(sys.executable)
     else:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base_dir, "scheduler_state.json")
+        return os.path.dirname(os.path.abspath(__file__))
+
+def get_state_path() -> str:
+    """Αρχείο για τα inputs (άτομα, ρυθμίσεις) - autosave στο κλείσιμο."""
+    return os.path.join(get_base_dir(), "scheduler_people.json")
+
+def get_schedule_path() -> str:
+    """Αρχείο για τα παραγόμενα προγράμματα - αποθηκεύεται μόνο χειροκίνητα."""
+    return os.path.join(get_base_dir(), "scheduler_schedule.json")
 
 
 def safe_int(s: str, default: int) -> int:
@@ -507,11 +514,13 @@ def solve_with_two_phase_backtracking(
     leaves: dict[str, set[int]],
     quotas: dict[str, int],
     holiday_quotas: dict[str, int],
-    preferences: dict[str, set[int]] | None = None,  # NEW: preferences!
+    friday_quotas: dict[str, int] | None = None,
+    preferences: dict[str, set[int]] | None = None,
     min_gap: int = 2,
     custom_min_gap: dict[str, int] | None = None,
     pre_assigned: dict[int, str] | None = None,
     log_cb=None,
+    ignore_weekend_pair_days: set[int] | None = None,  # days where Sat/Fri rule is relaxed
 ) -> tuple[dict[int, str], dict, str]:
     """
     Two-phase solver with score balancing and per-person min_gap support.
@@ -535,6 +544,12 @@ def solve_with_two_phase_backtracking(
     if pre_assigned is None:
         pre_assigned = {}
     
+    if friday_quotas is None:
+        friday_quotas = {p: 0 for p in names}
+
+    # Flag to enable/disable friday quota enforcement (may be relaxed if solver fails)
+    enforce_friday_quota = [True]
+
     log_cb("🎯 Two-phase solver (Αργίες πρώτα, μετά καθημερινές)...")
     
     _, days_in_month = calendar.monthrange(year, month)
@@ -545,6 +560,7 @@ def solve_with_two_phase_backtracking(
     
     holiday_days = sorted([d for d in available_days if day_bucket(year, month, d, extra_holidays) == "HOLIDAY"])
     weekdays = sorted([d for d in available_days if day_bucket(year, month, d, extra_holidays) == "WEEKDAY"])
+    friday_days = set(d for d in weekdays if dt.date(year, month, d).weekday() == 4)
     
     log_cb(f"  📅 Pre-assigned: {len(pre_assigned)} μέρες")
     log_cb(f"  📅 Αργίες: {len(holiday_days)} μέρες")
@@ -560,38 +576,52 @@ def solve_with_two_phase_backtracking(
     # Helper to check weekend-specific forbidden pairs
     def is_forbidden_weekend_pair(day1: int, day2: int) -> bool:
         """
-        Check if day1 -> day2 is a forbidden weekend pair:
-        - Friday -> Wednesday next week (gap=5): FORBIDDEN
-        - Saturday -> Thursday next week (gap=5): FORBIDDEN
-        
-        Example: March 7 (Friday) -> March 12 (Wednesday): NOT ALLOWED
-                 March 8 (Saturday) -> March 13 (Thursday): NOT ALLOWED
+        Service-specific Fri/Sat gap rules (FORBIDDEN if next assignment is too close):
+
+        AYDM & PYLI:
+          - Friday requires gap >= 3
+          - Saturday requires gap >= 4
+
+        FKX & BAYDM:
+          - Friday requires gap >= 4
+          - Saturday requires gap >= 5
         """
-        if day1 >= day2:  # Only check forward
+        if day1 >= day2:
             return False
-        
+
         gap_days = day2 - day1
-        
-        # Get weekday for both days
+
+        # Detect service/tab key from enclosing scope (tab_key exists in your program)
         try:
-            date1 = dt.date(year, month, day1)
-            date2 = dt.date(year, month, day2)
-            weekday1 = date1.weekday()  # Monday=0, Friday=4, Saturday=5, Sunday=6
-            weekday2 = date2.weekday()
-            
-            # Rule 1: Friday -> Wednesday next week (gap=5, Wed=2)
-            if weekday1 == 4 and weekday2 == 2 and gap_days == 5:
-                return True
-            
-            # Rule 2: Saturday -> Thursday next week (gap=5, Thu=3)
-            if weekday1 == 5 and weekday2 == 3 and gap_days == 5:
-                return True
-            
+            service = tab_key  # e.g. "AYDM", "BAYDM", "FKX", "PYLI"
+        except NameError:
+            service = "AYDM"   # safe default if not in scope
+
+        # Map per-service rules
+        if service in ("AYDM", "PYLI"):
+            req_gap_fri = 3
+            req_gap_sat = 4
+        elif service in ("FKX", "BAYDM"):
+            req_gap_fri = 4
+            req_gap_sat = 5
+        else:
+            # Unknown service -> no special weekend rule
+            return False
+
+        # Determine weekday of day1
+        try:
+            weekday1 = dt.date(year, month, day1).weekday()  # Mon=0 ... Fri=4 Sat=5 Sun=6
         except ValueError:
-            # Invalid date, ignore
-            pass
-        
+            return False
+
+        # Apply rule only if day1 is Friday or Saturday
+        if weekday1 == 4:  # Friday
+            return gap_days <= req_gap_fri
+        if weekday1 == 5:  # Saturday
+            return gap_days <= req_gap_sat
+
         return False
+
     
     # Helper to check weekend-specific constraints
     def violates_weekend_rule(person: str, day1: int, day2: int) -> bool:
@@ -656,15 +686,15 @@ def solve_with_two_phase_backtracking(
                 continue
             
             # Check weekend-specific forbidden pairs (includes pre-assigned)
-            for other_day, other_person in full_assigned.items():
-                if other_day in pre_assigned:
-                    continue
-                if other_person == p:
-                    # Check both directions
-                    if is_forbidden_weekend_pair(other_day, d) or is_forbidden_weekend_pair(d, other_day):
-                        ok = False
-                        break
-            
+            if ignore_weekend_pair_days is None or d not in ignore_weekend_pair_days:
+                for other_day, other_person in full_assigned.items():
+                    if other_day in pre_assigned:
+                        continue
+                    if other_person == p:
+                        if is_forbidden_weekend_pair(other_day, d) or is_forbidden_weekend_pair(d, other_day):
+                            ok = False
+                            break
+
             if ok:
                 cands.append(p)
         
@@ -798,6 +828,12 @@ def solve_with_two_phase_backtracking(
             if weekday_used >= remaining_total_quotas[p]:
                 continue
             
+            # Check friday quota (only when day d is a Friday, and only if enforced)
+            if enforce_friday_quota[0] and d in friday_days:
+                friday_used = sum(1 for dd, pp in partial.items() if pp == p and dd in friday_days)
+                if friday_used >= friday_quotas.get(p, 0):
+                    continue
+            
             # Check min gap (with ALL assigned days: pre-assigned + holidays + weekdays, per-person gap)
             full_schedule = {**pre_assigned, **holiday_schedule, **partial}
             person_gap = get_min_gap(p)
@@ -817,15 +853,15 @@ def solve_with_two_phase_backtracking(
                 continue
             
             # Check weekend-specific forbidden pairs
-            for other_day, other_person in full_schedule.items():
-                if other_day in pre_assigned:
-                    continue
-                if other_person == p:
-                    # Check both directions
-                    if is_forbidden_weekend_pair(other_day, d) or is_forbidden_weekend_pair(d, other_day):
-                        ok = False
-                        break
-            
+            if ignore_weekend_pair_days is None or d not in ignore_weekend_pair_days:
+                for other_day, other_person in full_schedule.items():
+                    if other_day in pre_assigned:
+                        continue
+                    if other_person == p:
+                        if is_forbidden_weekend_pair(other_day, d) or is_forbidden_weekend_pair(d, other_day):
+                            ok = False
+                            break
+
             if ok:
                 cands.append(p)
         
@@ -932,10 +968,21 @@ def solve_with_two_phase_backtracking(
         return False
     
     # Try to assign weekdays
+    # Attempt 1: with friday quota strictly enforced
     weekday_schedule = {}
     remaining_weekday_quotas = remaining_total_quotas.copy()
-    
-    if not backtrack_weekdays(0, weekday_schedule, remaining_weekday_quotas, depth=0):
+    weekday_success = backtrack_weekdays(0, weekday_schedule, remaining_weekday_quotas, depth=0)
+
+    # Attempt 2: if failed, relax friday quota constraint and retry
+    if not weekday_success:
+        enforce_friday_quota[0] = False
+        recursion_cutoff_count[0] = 0
+        weekday_schedule = {}
+        remaining_weekday_quotas = remaining_total_quotas.copy()
+        log_cb("  ⚠️  Friday quota constraint χαλάρωσε - επαναπροσπάθεια...")
+        weekday_success = backtrack_weekdays(0, weekday_schedule, remaining_weekday_quotas, depth=0)
+
+    if not weekday_success:
         # Provide detailed error info
         error_details = f"Οι αργίες ανατέθηκαν, αλλά δεν μπορούν να κατανεμηθούν οι καθημερινές.\n"
         error_details += f"Καθημερινές: {len(weekdays)} μέρες\n"
@@ -1124,9 +1171,8 @@ def solve_all_tabs_unified(
 # -----------------------------
 # History Management
 # -----------------------------
-# Save history in the same directory as the script
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-HISTORY_FILE = os.path.join(SCRIPT_DIR, "ipiresies_history.json")
+# Save history in the same directory as the exe/script
+HISTORY_FILE = os.path.join(get_base_dir(), "ipiresies_history.json")
 
 
 def get_person_group(rank: str) -> str:
@@ -1202,6 +1248,17 @@ def add_to_history(
     if month_str not in history[year_str]:
         history[year_str][month_str] = {}
     
+    # Αν το tab έχει ήδη αποθηκευτεί για αυτόν τον μήνα, σβήνουμε τα παλιά δεδομένα
+    # και τα αντικαθιστούμε με τα νέα (αντί να τα αθροίζουμε)
+    saved_tabs = history[year_str][month_str].get("_saved_tabs", [])
+    if tab_key in saved_tabs:
+        # Βρες και διέγραψε τις εγγραφές που ανήκουν σε αυτό το tab
+        # (δεν ξέρουμε ποιοι ανήκουν σε ποιο tab, οπότε σβήνουμε όσα είναι στο schedule)
+        people_in_schedule = set(schedule.values())
+        for person in people_in_schedule:
+            if person in history[year_str][month_str]:
+                del history[year_str][month_str][person]
+
     # Count by category for each person
     for day, person in schedule.items():
         if person not in history[year_str][month_str]:
@@ -1223,6 +1280,12 @@ def add_to_history(
             history[year_str][month_str][person]["friday"] += 1
         else:  # Mon-Thu
             history[year_str][month_str][person]["weekday"] += 1
+    
+    # Σημείωσε το tab ως αποθηκευμένο για αυτόν τον μήνα
+    if "_saved_tabs" not in history[year_str][month_str]:
+        history[year_str][month_str]["_saved_tabs"] = []
+    if tab_key not in history[year_str][month_str]["_saved_tabs"]:
+        history[year_str][month_str]["_saved_tabs"].append(tab_key)
     
     save_history(history)
 
@@ -1447,6 +1510,95 @@ def compute_holiday_quotas_with_history(
     return quotas
 
 
+def compute_friday_quotas_with_history(
+    names: list[str],
+    total_fridays: int,
+    cumulative_stats: dict[str, dict],
+    ranks: dict[str, str],
+    rng: random.Random,
+    leaves: dict[str, set[int]] = None,
+    year: int = None,
+    month: int = None,
+) -> dict[str, int]:
+    """
+    Compute Friday quotas with GROUP-BASED MIN-MAX balancing (±1 rule).
+    Same logic as compute_holiday_quotas_with_history but for Fridays.
+    - ZERO quota for people with NO available Fridays.
+    """
+    if leaves is None:
+        leaves = {}
+
+    # Check which people have at least one available Friday
+    available_for_fridays = []
+    if year and month:
+        import calendar as cal
+        _, days_in_month = cal.monthrange(year, month)
+        for name in names:
+            leave_days = leaves.get(name, set())
+            has_friday = False
+            for d in range(1, days_in_month + 1):
+                if d not in leave_days and dt.date(year, month, d).weekday() == 4:  # Friday
+                    has_friday = True
+                    break
+            if has_friday:
+                available_for_fridays.append(name)
+    else:
+        available_for_fridays = names[:]
+
+    if not available_for_fridays:
+        return {name: 0 for name in names}
+
+    base, extra = divmod(total_fridays, len(available_for_fridays))
+    quotas = {name: 0 for name in names}
+    for name in available_for_fridays:
+        quotas[name] = base
+
+    if extra == 0:
+        return quotas
+
+    # Group by rank for fair distribution
+    groups = {"OFFICERS": [], "OTHERS": []}
+    for name in available_for_fridays:
+        rank = ranks.get(name, "")
+        group = get_person_group(rank)
+        groups[group].append(name)
+
+    remaining_extra = extra
+
+    for group_name, group_members in groups.items():
+        if not group_members or remaining_extra == 0:
+            continue
+
+        members_sorted = sorted(
+            group_members,
+            key=lambda n: (
+                cumulative_stats.get(n, {}).get("total_fridays", 0),
+                rng.random()
+            )
+        )
+
+        group_extra = min(remaining_extra, len(group_members))
+        for i in range(group_extra):
+            quotas[members_sorted[i]] = base + 1
+            remaining_extra -= 1
+
+    if remaining_extra > 0:
+        available = [n for n in available_for_fridays if quotas[n] == base]
+        if available:
+            available_sorted = sorted(
+                available,
+                key=lambda n: (
+                    cumulative_stats.get(n, {}).get("total_fridays", 0),
+                    rng.random()
+                )
+            )
+            for i in range(min(remaining_extra, len(available_sorted))):
+                quotas[available_sorted[i]] = base + 1
+
+    return quotas
+
+
+
 # -----------------------------
 # Main Solver (single tab)
 # -----------------------------
@@ -1496,6 +1648,12 @@ def solve_schedule_best_effort(
     total_holidays = sum(
         1 for d in range(1, days_in_month + 1)
         if day_bucket(year, month, d, extra_holidays) == "HOLIDAY"
+    )
+
+    # Count total Fridays in month
+    total_fridays = sum(
+        1 for d in range(1, days_in_month + 1)
+        if dt.date(year, month, d).weekday() == 4  # Friday
     )
 
     # AUTO-CALCULATE MAX for people with limited availability (caps + custom min gaps)
@@ -1624,7 +1782,36 @@ def solve_schedule_best_effort(
 
         return holiday_quotas
 
-    
+
+    def build_friday_quotas(
+        rng: random.Random,
+        quotas: dict[str, int],
+        forced_friday_counts: dict[str, int],
+    ) -> dict[str, int]:
+        """Friday quotas for the *remaining* assignments (±1 rule, separate from holidays)."""
+        cumulative_stats = calculate_cumulative_stats(year, month, tab_key, names)
+        friday_quotas_total = compute_friday_quotas_with_history(
+            names, total_fridays, cumulative_stats, ranks if ranks else {},
+            rng,
+            leaves=leaves,
+            year=year,
+            month=month,
+        )
+
+        friday_quotas: dict[str, int] = {}
+        for p in names:
+            forced_f = int(forced_friday_counts.get(p, 0))
+            q_total = int(friday_quotas_total.get(p, 0))
+            q_remaining = max(0, q_total - forced_f)
+            # Clamp by remaining total quotas
+            qp = int(quotas.get(p, 0))
+            q_remaining = min(q_remaining, qp)
+            if qp <= 0:
+                q_remaining = 0
+            friday_quotas[p] = q_remaining
+
+        return friday_quotas
+
     def build_forced_preassigned(rng: random.Random) -> dict[int, str]:
         """Turn 'preferences' into forced pre-assignments.
 
@@ -1673,132 +1860,121 @@ def solve_schedule_best_effort(
 
         return forced
 # Try multiple times with different random seeds to find best score spread
+    # Phase A: target spread = 0.0 | Phase B: accept spread <= 1.0
     best_spread = float("inf")
     best_schedule = None
     best_quotas = None
     best_meta = None
     best_solve_info = {}
+    last_error = None
 
-    MAX_TRIES = 30 if preferences else 5
+    # Initialize fallback forced counts (will be updated by run_attempt if any attempt succeeds)
+    forced_pre: dict[int, str] = {}
+    forced_holiday_counts: dict[str, int] = {p: 0 for p in names}
+    forced_friday_counts: dict[str, int]  = {p: 0 for p in names}
 
-    for attempt in range(MAX_TRIES):
-        import time, os
-        seed = int(time.time() * 1000000) + attempt * 12345 + os.getpid() + _solve_counter * 99991
-        rng = random.Random(seed)
+    TRIES_A = 40  # Single phase targeting spread <= 1.0
 
-        # -------------------- FORCED PREFERENCES --------------------
-        forced_pre = build_forced_preassigned(rng)
+    def run_attempt(attempt_num, rng):
+        nonlocal last_error, forced_pre, forced_holiday_counts, forced_friday_counts
+        _forced_pre = build_forced_preassigned(rng)
 
-        # Count forced assignments per person (total + holidays)
-        forced_counts: dict[str, int] = {p: 0 for p in names}
-        forced_holiday_counts: dict[str, int] = {p: 0 for p in names}
-        for d, p in forced_pre.items():
-            forced_counts[p] = forced_counts.get(p, 0) + 1
+        _forced_counts: dict[str, int] = {p: 0 for p in names}
+        _forced_hol: dict[str, int]    = {p: 0 for p in names}
+        _forced_fri: dict[str, int]    = {p: 0 for p in names}
+        for d, p in _forced_pre.items():
+            _forced_counts[p] = _forced_counts.get(p, 0) + 1
             if day_bucket(year, month, d, extra_holidays) == "HOLIDAY":
-                forced_holiday_counts[p] = forced_holiday_counts.get(p, 0) + 1
+                _forced_hol[p] = _forced_hol.get(p, 0) + 1
+            if dt.date(year, month, d).weekday() == 4:
+                _forced_fri[p] = _forced_fri.get(p, 0) + 1
 
-        # -------------------- TOTAL QUOTAS --------------------
-        quotas_total = build_quotas(rng)
-
-        # Reduce quotas by already-forced assignments (so solver fills the rest)
-        quotas: dict[str, int] = {}
+        _qtotal = build_quotas(rng)
+        _quotas: dict[str, int] = {}
         for p in names:
-            q = int(quotas_total.get(p, 0)) - int(forced_counts.get(p, 0))
-            quotas[p] = max(0, q)
+            q = int(_qtotal.get(p, 0)) - int(_forced_counts.get(p, 0))
+            _quotas[p] = max(0, q)
 
-        # Ensure quotas sum matches remaining unassigned days
-        remaining_unassigned = days_in_month - len(forced_pre)
-        diff = remaining_unassigned - sum(quotas.values())
-
-        if diff != 0:
-            # Prefer adjusting non-fixed people first
-            adjustable = [p for p in names if p not in fixed_people]
-            if not adjustable:
-                adjustable = names[:]
-
-            if diff > 0:
-                # Need to add quota
-                for _ in range(diff):
-                    rng.shuffle(adjustable)
-                    added = False
-                    for p in adjustable:
-                        cap = combined_max_caps.get(p, None)
-                        if cap is not None:
-                            try:
-                                cap = int(cap)
-                            except Exception:
-                                cap = None
-                        # Total already assigned (forced) + remaining quota
-                        total_planned = int(forced_counts.get(p, 0)) + int(quotas.get(p, 0))
-                        if cap is None or total_planned < cap:
-                            quotas[p] += 1
-                            added = True
-                            break
-                    if not added:
-                        quotas[rng.choice(adjustable)] += 1
+        _remaining = days_in_month - len(_forced_pre)
+        _diff = _remaining - sum(_quotas.values())
+        if _diff != 0:
+            _adj = [p for p in names if p not in fixed_people] or names[:]
+            if _diff > 0:
+                for _ in range(_diff):
+                    rng.shuffle(_adj)
+                    _added = False
+                    for p in _adj:
+                        _cap = combined_max_caps.get(p)
+                        if _cap is not None:
+                            try: _cap = int(_cap)
+                            except: _cap = None
+                        _planned = int(_forced_counts.get(p,0)) + int(_quotas.get(p,0))
+                        if _cap is None or _planned < _cap:
+                            _quotas[p] += 1; _added = True; break
+                    if not _added:
+                        _quotas[rng.choice(_adj)] += 1
             else:
-                # Need to remove quota
-                to_remove = -diff
-                pool = [p for p in adjustable if quotas.get(p, 0) > 0]
-                for _ in range(to_remove):
-                    if not pool:
-                        break
-                    p = rng.choice(pool)
-                    quotas[p] -= 1
-                    if quotas[p] <= 0:
-                        pool = [x for x in pool if x != p]
+                _pool = [p for p in _adj if _quotas.get(p,0) > 0]
+                for _ in range(-_diff):
+                    if not _pool: break
+                    p = rng.choice(_pool)
+                    _quotas[p] -= 1
+                    if _quotas[p] <= 0:
+                        _pool = [x for x in _pool if x != p]
 
-        # -------------------- HOLIDAY QUOTAS --------------------
-        holiday_quotas = build_holiday_quotas(rng, quotas, forced_holiday_counts)
+        _hol_q = build_holiday_quotas(rng, _quotas, _forced_hol)
+        _fri_q = build_friday_quotas(rng, _quotas, _forced_fri)
 
-        if attempt == 0:
+        if attempt_num == 0:
             if DEBUG:
                 log_cb(f"  DEBUG combined_max_caps: {combined_max_caps}")
                 log_cb(f"  DEBUG fixed_max: {fixed_max}")
-            log_cb(f"📊 Total quotas: {quotas}")
-            log_cb(f"🎉 Holiday quotas: {holiday_quotas} (σύνολο αργιών: {total_holidays})")
+            log_cb(f"📊 Total quotas: {_quotas}")
+            log_cb(f"🎉 Holiday quotas: {_hol_q} (σύνολο αργιών: {total_holidays})")
+            log_cb(f"📅 Friday quotas: {_fri_q} (σύνολο παρασκευών: {total_fridays})")
 
         try:
-            if attempt == 0:
-                log_cb("📌 Προσπάθεια: Two-phase (Αργίες → Καθημερινές)...")
-
-            schedule, solve_info, method = solve_with_two_phase_backtracking(
-                names=names,
-                year=year,
-                month=month,
-                extra_holidays=extra_holidays,
-                leaves=leaves,
-                quotas=quotas,
-                holiday_quotas=holiday_quotas,
-                preferences=preferences,
-                min_gap=MIN_GAP_STRICT,
-                custom_min_gap=custom_min_gap,
-                pre_assigned=forced_pre,
-                  # no MAX pre-assign
-                log_cb=log_cb if attempt == 0 else (lambda m: None),
+            if attempt_num == 0:
+                log_cb("📌 \u03A0\u03C1\u03BF\u03C3\u03C0\u03AC\u03B8\u03B5\u03B9\u03B1: Two-phase (\u0391\u03C1\u03B3\u03AF\u03B5\u03C2 \u2192 \u039A\u03B1\u03B8\u03B7\u03BC\u03B5\u03C1\u03B9\u03BD\u03AD\u03C2)...")
+            _sched, _si, _meth = solve_with_two_phase_backtracking(
+                names=names, year=year, month=month,
+                extra_holidays=extra_holidays, leaves=leaves,
+                quotas=_quotas, holiday_quotas=_hol_q, friday_quotas=_fri_q,
+                preferences=preferences, min_gap=MIN_GAP_STRICT,
+                custom_min_gap=custom_min_gap, pre_assigned=_forced_pre,
+                log_cb=log_cb if attempt_num == 0 else (lambda m: None),
             )
+            _meta = compute_schedule_metadata(_sched, year, month, extra_holidays)
+            _scores = [m["score"] for m in _meta.values()]
+            _spread = max(_scores) - min(_scores) if _scores else 0.0
 
-            meta = compute_schedule_metadata(schedule, year, month, extra_holidays)
-            scores = [m["score"] for m in meta.values()]
-            spread = max(scores) - min(scores) if scores else 0.0
-
-            log_cb(f"  🎯 Προσπάθεια #{attempt + 1}: Score spread = {spread:.2f}")
-
-            if spread < best_spread:
-                best_spread = spread
-                best_schedule = schedule
-                best_quotas = quotas
-                best_meta = meta
-                best_solve_info = solve_info
-
-            if spread <= 1.0:
-                log_cb("  ✅ Βρέθηκε άριστο πρόγραμμα με spread ≤ 1.0!")
-                break
-
+            # Update shared forced vars so fallbacks have valid values
+            forced_pre = _forced_pre
+            forced_holiday_counts = _forced_hol
+            forced_friday_counts  = _forced_fri
+            return _spread, _sched, _quotas, _meta, _si, _forced_pre
         except ScheduleError as e:
-            if attempt == 0:
+            if attempt_num == 0:
                 log_cb(f"⚠️  Two-phase αποτυχία: {e.details}")
-            continue
+            last_error = e
+            return None
+
+    import time as _t, os as _os
+
+    # ── Αναζήτηση spread ≤ 1.0 ───────────────────────────────────
+    log_cb(f"🔍 Αναζήτηση spread ≤ 1.0 ({TRIES_A} προσπάθειες)...")
+    for _att in range(TRIES_A):
+        _seed = int(_t.time()*1000000) + _att*12345 + _os.getpid() + _solve_counter*99991
+        _rng = random.Random(_seed)
+        _res = run_attempt(_att, _rng)
+        if _res is None: continue
+        _sp, _sc, _qu, _me, _si, _fp = _res
+        log_cb(f"  🎯 Προσπάθεια #{_att+1}: spread = {_sp:.2f}")
+        if _sp < best_spread:
+            best_spread, best_schedule, best_quotas, best_meta, best_solve_info = _sp, _sc, _qu, _me, _si
+        if best_spread <= 1.0:
+            log_cb("  ✅ Βρέθηκε spread ≤ 1.0!")
+            break
 
     if best_schedule is not None:
         if best_spread <= 1.0:
@@ -1807,8 +1983,9 @@ def solve_schedule_best_effort(
             log_cb(f"⚠️  Τελικό Score spread: {best_spread:.2f} (> 1.0, αλλά καλύτερο δυνατό)")
         return best_schedule, best_quotas, best_meta, best_solve_info
 
+
     # ------------------ Fallbacks: relax GAP only ------------------
-    log_cb("📌 Fallback 1: GAP=1 για πολύ περιορισμένους...")
+    log_cb("\U0001F4CC Fallback 1: GAP=1 για πολύ περιορισμένους...")
 
     highly_constrained = {}
     for name in names:
@@ -1822,30 +1999,24 @@ def solve_schedule_best_effort(
         rng = random.Random(int(time.time() * 1000) % (2**32))
         quotas = build_quotas(rng)
         holiday_quotas = build_holiday_quotas(rng, quotas, forced_holiday_counts)
-
+        friday_quotas_fb = build_friday_quotas(rng, quotas, forced_friday_counts)
         try:
             schedule, solve_info, method = solve_with_two_phase_backtracking(
-                names=names,
-                year=year,
-                month=month,
-                extra_holidays=extra_holidays,
-                leaves=leaves,
-                quotas=quotas,
-                holiday_quotas=holiday_quotas,
-                preferences=preferences,
-                min_gap=2,
-                custom_min_gap=highly_constrained,
-                pre_assigned=forced_pre,
-                
+                names=names, year=year, month=month,
+                extra_holidays=extra_holidays, leaves=leaves,
+                quotas=quotas, holiday_quotas=holiday_quotas,
+                friday_quotas=friday_quotas_fb,
+                preferences=preferences, min_gap=2,
+                custom_min_gap=highly_constrained, pre_assigned=forced_pre,
                 log_cb=lambda m: None,
             )
             meta = compute_schedule_metadata(schedule, year, month, extra_holidays)
             log_cb(f"✅ Βρέθηκε λύση με GAP=1 για {len(highly_constrained)} άτομα")
             return schedule, quotas, meta, solve_info
-        except ScheduleError:
-            pass
+        except ScheduleError as e:
+            last_error = e
 
-    log_cb("📌 Fallback 2: GAP=1 για μέτρια περιορισμένους...")
+    log_cb("\U0001F4CC Fallback 2: GAP=1 για μέτρια περιορισμένους...")
 
     moderately_constrained = {}
     for name in names:
@@ -1859,61 +2030,228 @@ def solve_schedule_best_effort(
         rng = random.Random(int(time.time() * 1000) % (2**32))
         quotas = build_quotas(rng)
         holiday_quotas = build_holiday_quotas(rng, quotas, forced_holiday_counts)
-
+        friday_quotas_fb = build_friday_quotas(rng, quotas, forced_friday_counts)
         try:
             schedule, solve_info, method = solve_with_two_phase_backtracking(
-                names=names,
-                year=year,
-                month=month,
-                extra_holidays=extra_holidays,
-                leaves=leaves,
-                quotas=quotas,
-                holiday_quotas=holiday_quotas,
-                preferences=preferences,
-                min_gap=2,
-                custom_min_gap=moderately_constrained,
-                pre_assigned=forced_pre,
-                
+                names=names, year=year, month=month,
+                extra_holidays=extra_holidays, leaves=leaves,
+                quotas=quotas, holiday_quotas=holiday_quotas,
+                friday_quotas=friday_quotas_fb,
+                preferences=preferences, min_gap=2,
+                custom_min_gap=moderately_constrained, pre_assigned=forced_pre,
                 log_cb=lambda m: None,
             )
             meta = compute_schedule_metadata(schedule, year, month, extra_holidays)
             log_cb(f"✅ Βρέθηκε λύση με GAP=1 για {len(moderately_constrained)} άτομα")
             return schedule, quotas, meta, solve_info
-        except ScheduleError:
-            pass
+        except ScheduleError as e:
+            last_error = e
 
-    log_cb("📌 Fallback 3: GAP=1 για όλους...")
+    log_cb("\U0001F4CC Fallback 3: GAP=1 για όλους...")
 
     import time
     rng = random.Random(int(time.time() * 1000) % (2**32))
     quotas = build_quotas(rng)
     holiday_quotas = build_holiday_quotas(rng, quotas, forced_holiday_counts)
-
+    friday_quotas_fb = build_friday_quotas(rng, quotas, forced_friday_counts)
     try:
         schedule, solve_info, method = solve_with_two_phase_backtracking(
-            names=names,
-            year=year,
-            month=month,
-            extra_holidays=extra_holidays,
-            leaves=leaves,
-            quotas=quotas,
-            holiday_quotas=holiday_quotas,
-            preferences=preferences,
-            min_gap=1,
-            custom_min_gap=None,
-            pre_assigned=forced_pre,
-                
+            names=names, year=year, month=month,
+            extra_holidays=extra_holidays, leaves=leaves,
+            quotas=quotas, holiday_quotas=holiday_quotas,
+            friday_quotas=friday_quotas_fb,
+            preferences=preferences, min_gap=1,
+            custom_min_gap=None, pre_assigned=forced_pre,
             log_cb=lambda m: None,
         )
         meta = compute_schedule_metadata(schedule, year, month, extra_holidays)
-        log_cb("✅ Βρέθηκε λύση με GAP=1 για όλους")
+        log_cb("✅ Βρέθηκε λύση με GAP=1 για \u03CC\u03BB\u03BF\u03C5\u03C2")
         return schedule, quotas, meta, solve_info
-    except ScheduleError:
-        pass
+    except ScheduleError as e:
+        last_error = e
 
+
+    # ── PROGRESSIVE CONSTRAINT RELAXATION ────────────────────────
+    # Step 1: Relax Friday quota constraint (try completely without Friday balancing)
+
+    log_cb("🔧 Φάση Γ: Χαλάρωση κανόνα Παρασκευών...")
+
+    def try_without_friday_quota():
+        import time as _tfy
+        _best_sp = float("inf")
+        _best_res = None
+        for _xi in range(20):
+            _xseed = int(_tfy.time()*1000000) + _xi*44444
+            _xrng  = random.Random(_xseed)
+            _xq    = build_quotas(_xrng)
+            _xhq   = build_holiday_quotas(_xrng, _xq, forced_holiday_counts)
+            # No friday quota - pass all 999
+            _xfq   = {p: 999 for p in names}
+            try:
+                _sc, _si, _ = solve_with_two_phase_backtracking(
+                    names=names, year=year, month=month, extra_holidays=extra_holidays,
+                    leaves=leaves, quotas=_xq, holiday_quotas=_xhq, friday_quotas=_xfq,
+                    preferences=preferences, min_gap=MIN_GAP_STRICT,
+                    custom_min_gap=custom_min_gap, pre_assigned=forced_pre,
+                    log_cb=lambda m: None,
+                )
+                _meta = compute_schedule_metadata(_sc, year, month, extra_holidays)
+                _scores = [m["score"] for m in _meta.values()]
+                _sp = max(_scores) - min(_scores) if _scores else 0.0
+                if _sp < _best_sp:
+                    _best_sp = _sp
+                    _best_res = (_sc, _xq, _meta, _si)
+                if _best_sp <= 1.0:
+                    break
+            except ScheduleError:
+                continue
+        return _best_res, _best_sp
+
+    _res_fri, _sp_fri = try_without_friday_quota()
+    if _res_fri is not None:
+        _sc_fri, _q_fri, _m_fri, _si_fri = _res_fri
+        log_cb(f"  ⚠️  ΠΡΟΣΟΧΗ: Κανόνας Παρασκευών αγνοήθηκε")
+        log_cb(f"✅ Βρέθηκε πρόγραμμα χωρίς Friday quota (spread={_sp_fri:.2f})")
+        _si_fri['relaxed_friday_quota'] = True
+        return _sc_fri, _q_fri, _m_fri, _si_fri
+
+    # Step 2: Relax Sat/Fri pair rule only for the specific days that need it
+
+    log_cb("🔧 Φάση Δ: Χαλάρωση κανόνα Παρ/Σαβ για συγκεκριμένες μέρες...")
+
+    def try_with_relaxed_weekend_pair(ignore_days):
+        import time as _tw
+        _best_sp = float("inf")
+        _best_res = None
+        for _xi in range(20):
+            _xseed = int(_tw.time()*1000000) + _xi*33333
+            _xrng  = random.Random(_xseed)
+            _xq    = build_quotas(_xrng)
+            _xhq   = build_holiday_quotas(_xrng, _xq, forced_holiday_counts)
+            _xfq   = build_friday_quotas(_xrng, _xq, forced_friday_counts)
+            try:
+                _sc, _si, _ = solve_with_two_phase_backtracking(
+                    names=names, year=year, month=month, extra_holidays=extra_holidays,
+                    leaves=leaves, quotas=_xq, holiday_quotas=_xhq, friday_quotas=_xfq,
+                    preferences=preferences, min_gap=MIN_GAP_STRICT,
+                    custom_min_gap=custom_min_gap, pre_assigned=forced_pre,
+                    log_cb=lambda m: None,
+                    ignore_weekend_pair_days=ignore_days,
+                )
+                _meta = compute_schedule_metadata(_sc, year, month, extra_holidays)
+                _scores = [m["score"] for m in _meta.values()]
+                _sp = max(_scores) - min(_scores) if _scores else 0.0
+                if _sp < _best_sp:
+                    _best_sp = _sp
+                    _best_res = (_sc, _xq, _meta, _si)
+                if _best_sp <= 1.0:
+                    break
+            except ScheduleError:
+                continue
+        return _best_res, _best_sp
+
+    _, _dim_r = calendar.monthrange(year, month)
+    _friday_days_r = {d for d in range(1, _dim_r+1) if dt.date(year, month, d).weekday() == 4}
+
+    # Find days mentioned in last_error with "Κανόνας Σαβ/Παρ"
+    _weekend_problem_days = set()
+    if last_error and hasattr(last_error, 'details') and last_error.details:
+        import re
+        for _match in re.finditer(r'(\d+)/' + str(month), last_error.details):
+            _d = int(_match.group(1))
+            # Check if this day has a Σαβ/Παρ mention nearby
+            _pos = _match.start()
+            _context = last_error.details[max(0,_pos-5):_pos+50]
+            if 'Κανόνας Σαβ/Παρ' in last_error.details[_pos:_pos+200]:
+                _weekend_problem_days.add(_d)
+        # Also add: days that appear in "few_cand" section with Σαβ/Παρ exclusions
+        for _d in range(1, _dim_r+1):
+            _day_str = f"{_d}/{month}"
+            _idx = last_error.details.find(_day_str)
+            if _idx >= 0:
+                _section = last_error.details[_idx:_idx+400]
+                if 'Κανόνας Σαβ/Παρ' in _section:
+                    _weekend_problem_days.add(_d)
+
+    if not _weekend_problem_days:
+        # Fallback: try all Fridays
+        _weekend_problem_days = _friday_days_r
+
+    log_cb(f"  🔧 Χαλάρωση Σαβ/Παρ για μέρες: {sorted(_weekend_problem_days)}")
+    _res_r, _sp_r = try_with_relaxed_weekend_pair(_weekend_problem_days)
+
+    if _res_r is not None:
+        _sc_r, _q_r, _m_r, _si_r = _res_r
+        _relaxed_str = ", ".join(f"{d}/{month}" for d in sorted(_weekend_problem_days))
+        log_cb(f"  ⚠️  ΠΡΟΣΟΧΗ: Κανόνας Σαβ/Παρ αγνοήθηκε για: {_relaxed_str}")
+        log_cb(f"✅ Βρέθηκε πρόγραμμα με χαλαρωμένο Σαβ/Παρ (spread={_sp_r:.2f})")
+        _si_r['relaxed_weekend_pair_days'] = sorted(_weekend_problem_days)
+        _si_r['relaxed_friday_quota'] = not enforce_friday_quota if 'enforce_friday_quota' in dir() else False
+        return _sc_r, _q_r, _m_r, _si_r
+
+    # ── FEASIBILITY PROOF ─────────────────────────────────────────
+    # Prove it is truly impossible before raising error.
+    # Use min_gap=1, no friday cap, extended timeout.
+    log_cb("\U0001F52C Έλεγχος αδυναμίας (min_gap=1, χαλαρά όρια)...")
+
+    import sys as _sys
+    _mod = _sys.modules[__name__]
+    _orig_time = _mod.SOLVER_MAX_TIME
+    _orig_mult = _mod.SOLVER_MAX_RECURSION_MULT
+    _mod.SOLVER_MAX_TIME = 60.0
+    _mod.SOLVER_MAX_RECURSION_MULT = 10
+
+    _proof_rng = random.Random(42)
+    _proof_q   = build_quotas(_proof_rng)
+    _proof_hq  = build_holiday_quotas(_proof_rng, _proof_q, forced_holiday_counts)
+    _feasible  = False
+    try:
+        solve_with_two_phase_backtracking(
+            names=names, year=year, month=month,
+            extra_holidays=extra_holidays, leaves=leaves,
+            quotas=_proof_q, holiday_quotas=_proof_hq,
+            friday_quotas={p: 999 for p in names},
+            preferences=None, min_gap=1,
+            custom_min_gap=None, pre_assigned={},
+            log_cb=lambda m: None,
+        )
+        _feasible = True
+    except ScheduleError:
+        _feasible = False
+    finally:
+        _mod.SOLVER_MAX_TIME = _orig_time
+        _mod.SOLVER_MAX_RECURSION_MULT = _orig_mult
+
+    if _feasible:
+        # Solvable but needs more attempts
+        log_cb("\u26A0\uFE0F  \u03A4\u03BF \u03C0\u03C1\u03CC\u03B3\u03C1\u03B1\u03BC\u03BC\u03B1 \u0392\u0393\u0391\u0399\u039D\u0395\u0399 \u03B1\u03BB\u03BB\u03AC \u03C7\u03C1\u03B5\u03B9\u03AC\u03B6\u03B5\u03C4\u03B1\u03B9 \u03C0\u03B5\u03C1\u03B9\u03C3\u03C3\u03CC\u03C4\u03B5\u03C1\u03B5\u03C2 προσπάθειες. \u0395\u03C0\u03B1\u03BD\u03B1\u03C0\u03C1\u03BF\u03C3\u03C0\u03AC\u03B8\u03B5\u03B9\u03B1...")
+        _mod.SOLVER_MAX_TIME = 60.0
+        _mod.SOLVER_MAX_RECURSION_MULT = 8
+        import time as _t2, os as _os2
+        _xbest = None
+        _xspread = float("inf")
+        for _xi in range(50):
+            _xseed = int(_t2.time()*1000000) + _xi*77777 + _solve_counter*11111
+            _xrng = random.Random(_xseed)
+            _xres = run_attempt(200+_xi, _xrng)
+            if _xres is None: continue
+            _xsp, _xsc, _xqu, _xme, _xsi, _xfp = _xres
+            log_cb(f"  \U0001F504 Επαναπροσπάθεια #{_xi+1}: spread = {_xsp:.2f}")
+            if _xsp < _xspread:
+                _xspread = _xsp; _xbest = (_xsc, _xqu, _xme, _xsi)
+            if _xspread <= 1.0: break
+        _mod.SOLVER_MAX_TIME = _orig_time
+        _mod.SOLVER_MAX_RECURSION_MULT = _orig_mult
+        if _xbest is not None:
+            log_cb(f"✅ Βρέθηκε λύση με spread = {_xspread:.2f}")
+            return _xbest[0], _xbest[1], _xbest[2], _xbest[3]
+
+    # Truly impossible
+    if last_error is not None:
+        raise last_error
     raise ScheduleError(
         "Αδύνατο πρόγραμμα",
-        details="Δεν βρέθηκε λύση με two-phase backtracking. Έλεγξε άδειες και constraints."
+        details="Δεν βρέθηκε λύση. Έλεγξε άδειες και constraints."
     )
 def compute_schedule_metadata(
     schedule: dict[int, str],
@@ -1970,97 +2308,6 @@ def set_cell_background(cell, color_rgb: tuple[int, int, int]):
     cell._element.get_or_add_tcPr().append(shading)
 
 
-def export_schedule_to_word(
-    filepath: str,
-    tab_key: str,
-    year: int,
-    month: int,
-    schedule: dict[int, str],
-    extra_holidays: set[int],
-    ranks: dict[str, str],
-):
-    doc = Document()
-    
-    # Set margins (narrower)
-    sections = doc.sections
-    for section in sections:
-        section.top_margin = Cm(2)
-        section.bottom_margin = Cm(2)
-        section.left_margin = Cm(2)
-        section.right_margin = Cm(2)
-    
-    # Title - Centered
-    title = doc.add_paragraph()
-    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = title.add_run("ΠΙΝΑΚΑΣ")
-    run.font.size = Pt(12)
-    run.bold = True
-    run.underline = True
-    
-    # Subtitle - Centered
-    subtitle = doc.add_paragraph()
-    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    month_name_upper = GREEK_MONTHS_GEN[month].upper()
-    run = subtitle.add_run(f"ΥΠΗΡΕΣΙΩΝ {TAB_TITLES.get(tab_key, tab_key)} ΜΗΝΟΣ {month_name_upper} {year}")
-    run.font.size = Pt(11)
-    run.bold = True
-    
-    doc.add_paragraph()  # Blank line
-    
-    # Table
-    _, days_in_month = calendar.monthrange(year, month)
-    table = doc.add_table(rows=days_in_month + 1, cols=4)
-    table.style = 'Table Grid'
-    
-    # Header row
-    hdr = table.rows[0].cells
-    hdr[0].text = "ΗΜΕΡΟΜΗΝΙΑ"
-    hdr[1].text = "ΗΜΕΡΑ"
-    hdr[2].text = "ΒΑΘΜΟΣ"
-    hdr[3].text = "ΟΝΟΜΑΤΕΠΩΝΥΜΟ"
-    
-    for cell in hdr:
-        cell.paragraphs[0].runs[0].font.bold = True
-        cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
-        # Gray background for header
-        shading = parse_xml(r'<w:shd {} w:fill="D3D3D3"/>'.format(nsdecls('w')))
-        cell._element.get_or_add_tcPr().append(shading)
-    
-    # Data rows
-    for day in range(1, days_in_month + 1):
-        row_idx = day
-        cells = table.rows[row_idx].cells
-        
-        date_obj = dt.date(year, month, day)
-        weekday = date_obj.strftime("%A")
-        weekday_gr = {
-            "Monday": "ΔΕΥΤΕΡΑ", "Tuesday": "ΤΡΙΤΗ", "Wednesday": "ΤΕΤΑΡΤΗ",
-            "Thursday": "ΠΕΜΠΤΗ", "Friday": "ΠΑΡΑΣΚΕΥΗ",
-            "Saturday": "ΣΑΒΒΑΤΟ", "Sunday": "ΚΥΡΙΑΚΗ"
-        }.get(weekday, weekday)
-        
-        date_str = f"{day}-{GREEK_MONTH_ABBR[month].upper()}-{str(year)[-2:]}"
-        cells[0].text = date_str
-        cells[1].text = weekday_gr
-        
-        person = schedule.get(day, "???")
-        rank = ranks.get(person, "")
-        cells[2].text = rank
-        cells[3].text = person.upper()
-        
-        # Center align all cells
-        for cell in cells:
-            cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
-        
-        # Gray background ONLY for holidays
-        bucket = day_bucket(year, month, day, extra_holidays)
-        if bucket == "HOLIDAY":
-            for cell in cells:
-                shading = parse_xml(r'<w:shd {} w:fill="D3D3D3"/>'.format(nsdecls('w')))
-                cell._element.get_or_add_tcPr().append(shading)
-    
-    doc.save(filepath)
-
 
 def export_all_schedules_to_word(
     filepath: str,
@@ -2071,102 +2318,138 @@ def export_all_schedules_to_word(
 ):
     """
     Export all schedules to a single Word file with page breaks.
-    
-    export_data = [
-        {"tab_key": "AYDM", "schedule": {...}, "ranks": {...}},
-        {"tab_key": "BAYDM", "schedule": {...}, "ranks": {...}},
-        ...
-    ]
     """
+    from docx.oxml import OxmlElement as _OE
+
     doc = Document()
-    
-    # Set margins (narrower)
-    sections = doc.sections
-    for section in sections:
-        section.top_margin = Cm(2)
+
+    # Margins
+    for section in doc.sections:
+        section.top_margin    = Cm(2)
         section.bottom_margin = Cm(2)
-        section.left_margin = Cm(2)
-        section.right_margin = Cm(2)
-    
+        section.left_margin   = Cm(2)
+        section.right_margin  = Cm(2)
+
+    def set_font(run, size_pt, bold=False):
+        run.font.name = "Cambria"
+        run.font.size = Pt(size_pt)
+        run.bold = bold
+
+    def set_row_height(row, h_cm=0.5):
+        trPr = row._tr.get_or_add_trPr()
+        trH = _OE("w:trHeight")
+        trH.set(qn("w:val"), str(int(Cm(h_cm).twips)))
+        trH.set(qn("w:hRule"), "exact")
+        trPr.append(trH)
+
+    def set_cell_width(cell, w_cm):
+        tc = cell._tc
+        tcPr = tc.get_or_add_tcPr()
+        tcW = _OE("w:tcW")
+        tcW.set(qn("w:w"), str(int(Cm(w_cm).twips)))
+        tcW.set(qn("w:type"), "dxa")
+        existing = tcPr.find(qn("w:tcW"))
+        if existing is not None:
+            tcPr.remove(existing)
+        tcPr.insert(0, tcW)
+
+    def set_cell_valign_center(cell):
+        tcPr = cell._tc.get_or_add_tcPr()
+        vAlign = _OE("w:vAlign")
+        vAlign.set(qn("w:val"), "center")
+        tcPr.append(vAlign)
+
+    col_widths = [3, 3, 3, 5.5]
+    _, days_in_month = calendar.monthrange(year, month)
+
     for idx, data in enumerate(export_data):
         tab_key = data["tab_key"]
         schedule = data["schedule"]
-        ranks = data["ranks"]
-        
-        # Add page break before each tab (except first)
+        ranks    = data["ranks"]
+
         if idx > 0:
             doc.add_page_break()
-        
-        # Title - Centered
+
+        # Title
         title = doc.add_paragraph()
         title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = title.add_run("ΠΙΝΑΚΑΣ")
-        run.font.size = Pt(12)
-        run.bold = True
-        run.underline = True
-        
-        # Subtitle - Centered
+        r = title.add_run("ΠΙΝΑΚΑΣ")
+        set_font(r, 11, bold=True)
+        r.underline = True
+
+        # Subtitle
         subtitle = doc.add_paragraph()
         subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
         month_name_upper = GREEK_MONTHS_GEN[month].upper()
-        run = subtitle.add_run(f"ΥΠΗΡΕΣΙΩΝ {TAB_TITLES.get(tab_key, tab_key)} ΜΗΝΟΣ {month_name_upper} {year}")
-        run.font.size = Pt(11)
-        run.bold = True
-        
-        doc.add_paragraph()  # Blank line
-        
+        r = subtitle.add_run(f"ΥΠΗΡΕΣΙΩΝ {TAB_TITLES.get(tab_key, tab_key)} ΜΗΝΟΣ {month_name_upper} {year}")
+        set_font(r, 11, bold=True)
+
+        doc.add_paragraph()  # blank line
+
         # Table
-        _, days_in_month = calendar.monthrange(year, month)
         table = doc.add_table(rows=days_in_month + 1, cols=4)
-        table.style = 'Table Grid'
-        
+        table.style = "Table Grid"
+
+        # Column widths via tblGrid
+        tbl = table._tbl
+        tblGrid = _OE("w:tblGrid")
+        for w_cm in col_widths:
+            gc = _OE("w:gridCol")
+            gc.set(qn("w:w"), str(int(Cm(w_cm).twips)))
+            tblGrid.append(gc)
+        existing_grid = tbl.find(qn("w:tblGrid"))
+        if existing_grid is not None:
+            tbl.remove(existing_grid)
+        tbl.insert(1, tblGrid)
+
         # Header row
-        hdr = table.rows[0].cells
-        hdr[0].text = "ΗΜΕΡΟΜΗΝΙΑ"
-        hdr[1].text = "ΗΜΕΡΑ"
-        hdr[2].text = "ΒΑΘΜΟΣ"
-        hdr[3].text = "ΟΝΟΜΑΤΕΠΩΝΥΜΟ"
-        
-        for cell in hdr:
-            cell.paragraphs[0].runs[0].font.bold = True
-            cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
-            # Gray background for header
-            shading = parse_xml(r'<w:shd {} w:fill="D3D3D3"/>'.format(nsdecls('w')))
+        hdr_row = table.rows[0]
+        set_row_height(hdr_row)
+        hdr_labels = ["ΗΜΕΡΟΜΗΝΙΑ", "ΗΜΕΡΑ", "ΒΑΘΜΟΣ", "ΟΝΟΜΑΤΕΠΩΝΥΜΟ"]
+        for ci, cell in enumerate(hdr_row.cells):
+            set_cell_width(cell, col_widths[ci])
+            set_cell_valign_center(cell)
+            cell.text = ""
+            para = cell.paragraphs[0]
+            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            r = para.add_run(hdr_labels[ci])
+            set_font(r, 11, bold=True)
+            shading = parse_xml(r'<w:shd {} w:fill="D3D3D3"/>'.format(nsdecls("w")))
             cell._element.get_or_add_tcPr().append(shading)
-        
+
         # Data rows
         for day in range(1, days_in_month + 1):
-            row_idx = day
-            cells = table.rows[row_idx].cells
-            
-            date_obj = dt.date(year, month, day)
-            weekday = date_obj.strftime("%A")
+            row = table.rows[day]
+            set_row_height(row)
+            cells = row.cells
+
+            date_obj   = dt.date(year, month, day)
             weekday_gr = {
                 "Monday": "ΔΕΥΤΕΡΑ", "Tuesday": "ΤΡΙΤΗ", "Wednesday": "ΤΕΤΑΡΤΗ",
                 "Thursday": "ΠΕΜΠΤΗ", "Friday": "ΠΑΡΑΣΚΕΥΗ",
                 "Saturday": "ΣΑΒΒΑΤΟ", "Sunday": "ΚΥΡΙΑΚΗ"
-            }.get(weekday, weekday)
-            
+            }.get(date_obj.strftime("%A"), "")
+
+            person   = schedule.get(day, "???")
+            rank     = ranks.get(person, "")
             date_str = f"{day}-{GREEK_MONTH_ABBR[month].upper()}-{str(year)[-2:]}"
-            cells[0].text = date_str
-            cells[1].text = weekday_gr
-            
-            person = schedule.get(day, "???")
-            rank = ranks.get(person, "")
-            cells[2].text = rank
-            cells[3].text = person.upper()
-            
-            # Center align all cells
-            for cell in cells:
-                cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
-            
-            # Gray background ONLY for holidays
-            bucket = day_bucket(year, month, day, extra_holidays)
-            if bucket == "HOLIDAY":
+            row_vals = [date_str, weekday_gr, rank, person.upper()]
+
+            for ci, cell in enumerate(cells):
+                set_cell_width(cell, col_widths[ci])
+                set_cell_valign_center(cell)
+                cell.text = ""
+                para = cell.paragraphs[0]
+                para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                r = para.add_run(row_vals[ci])
+                set_font(r, 11)
+
+            # Gray background for holidays
+            if day_bucket(year, month, day, extra_holidays) == "HOLIDAY":
                 for cell in cells:
-                    shading = parse_xml(r'<w:shd {} w:fill="D3D3D3"/>'.format(nsdecls('w')))
+                    shading = parse_xml(r'<w:shd {} w:fill="D3D3D3"/>'.format(nsdecls("w")))
                     cell._element.get_or_add_tcPr().append(shading)
-    
+
     doc.save(filepath)
 
 
@@ -2202,6 +2485,7 @@ class PeopleTab(ttk.Frame):
         count_entry.pack(side="left", padx=6)
         
         ttk.Button(count_frame, text="Εφαρμογή", command=self.apply_count).pack(side="left")
+        ttk.Button(count_frame, text="💾 Αποθήκευση State", command=lambda: self.app_ref.on_manual_save_state()).pack(side="left", padx=(12, 0))
         
         canvas_frame = ttk.Frame(left)
         canvas_frame.pack(fill="both", expand=True)
@@ -2250,13 +2534,14 @@ class PeopleTab(ttk.Frame):
 
         self.export_btn = ttk.Button(
             toolbar,
-            text="Export Word",
-            command=lambda: self.app_ref.on_export_current_word(),
+            text="💾 Αποθήκευση",
+            command=lambda: self.app_ref.on_save_current_schedule(),
             state="disabled",
         )
         self.export_btn.pack(side="left")
         
         self.stats = tk.Text(right, height=35, width=60, wrap="word", state="disabled")
+        self.stats.tag_configure("warning", foreground="darkorange", font=("Consolas", 9, "bold"))
         self.stats.pack(fill="both", expand=True)
         
         self.stats.tag_config("warn_total", background="yellow")
@@ -2445,6 +2730,17 @@ class PeopleTab(ttk.Frame):
             self.stats.insert("end", f"⏱️  Χρόνος: {solve_info['time']}\n")
         if "status" in solve_info:
             self.stats.insert("end", f"📊 Status: {solve_info['status']}\n")
+
+        # Show constraint relaxation warnings prominently
+        if solve_info.get('relaxed_friday_quota'):
+            self.stats.insert("end", "⚠️  ΠΡΟΣΟΧΗ: Κανόνας ισοκατανομής Παρασκευών ΑΓΝΟΗΘΗΚΕ\n", "warning")
+            self.stats.insert("end", "    (Το πρόγραμμα δεν έβγαινε με ισοκατανομή Παρασκευών)\n", "warning")
+        if solve_info.get('relaxed_weekend_pair_days'):
+            _rdays = solve_info['relaxed_weekend_pair_days']
+            _rstr  = ", ".join(f"{d}/{month}" for d in _rdays)
+            self.stats.insert("end", f"⚠️  ΠΡΟΣΟΧΗ: Κανόνας Σαβ/Παρ ΑΓΝΟΗΘΗΚΕ για: {_rstr}\n", "warning")
+            self.stats.insert("end", "    (Το πρόγραμμα δεν έβγαινε χωρίς αυτή τη χαλάρωση)\n", "warning")
+
         self.stats.insert("end", "\n")
         
         _, days_in_month = calendar.monthrange(year, month)
@@ -2498,6 +2794,10 @@ class PeopleTab(ttk.Frame):
         
         if scores:
             self.stats.insert("end", f"\nScore spread (max-min) = {max(scores) - min(scores):.2f}\n")
+            # Spread only for people with 3+ total services
+            _scores_3plus = [meta[p]["score"] for p in meta if meta[p]["total"] >= 3]
+            if _scores_3plus and len(_scores_3plus) < len(scores):
+                self.stats.insert("end", f"Score spread (≥3 υπηρεσίες) = {max(_scores_3plus) - min(_scores_3plus):.2f}\n")
         
         # Summary of MIN_GAP usage
         gap_info = solve_info.get('min_gap_used', {})
@@ -2550,6 +2850,21 @@ class PeopleTab(ttk.Frame):
         self.apply_count()
         
         self.clear_program_view()
+        
+        # Restore saved schedule/ranks/display text if present
+        if "saved_schedule" in tab_state and tab_state["saved_schedule"]:
+            self.current_schedule = {int(k): v for k, v in tab_state["saved_schedule"].items()}
+            self.current_ranks = tab_state.get("saved_ranks", {})
+            saved_text = tab_state.get("saved_stats_text", "")
+            if saved_text:
+                try:
+                    self.stats.config(state="normal")
+                    self.stats.delete("1.0", "end")
+                    self.stats.insert("end", saved_text)
+                    self.stats.config(state="disabled")
+                    self.export_btn.config(state="normal")
+                except Exception:
+                    pass
     
     
 
@@ -2568,7 +2883,19 @@ class PeopleTab(ttk.Frame):
                 "leave": row["leave_var"].get().strip(),
                 "preference": row["preference_var"].get().strip(),
             })
-        return {"count": n, "people": people}
+        state = {"count": n, "people": people}
+        # Also save the current schedule/ranks/display text if exists
+        if self.current_schedule:
+            state["saved_schedule"] = {str(k): v for k, v in self.current_schedule.items()}
+            state["saved_ranks"] = self.current_ranks
+            # Save the stats text for display on reload
+            try:
+                self.stats.config(state="normal")
+                state["saved_stats_text"] = self.stats.get("1.0", "end")
+                self.stats.config(state="disabled")
+            except Exception:
+                pass
+        return state
 
 
 # -----------------------------
@@ -2775,6 +3102,7 @@ class SchedulerApp(tk.Tk):
                 except Exception as e:
                     print(f"Warning: Could not save {data['tab_key']} to history: {e}")
             
+            self.save_schedule_state()
             messagebox.showinfo(
                 "Επιτυχία", 
                 f"Εξαγωγή σε:\n{filepath}\n\n✅ Αποθηκεύτηκε στο ιστορικό!"
@@ -2808,52 +3136,51 @@ class SchedulerApp(tk.Tk):
             )
             
             tab.render_program(year, month, extra, sched, ranks, quotas, meta, solve_info)
-            self.save_state()
             messagebox.showinfo("OK", "Βγήκε νέο πρόγραμμα ✅")
         
         except ScheduleError as e:
             tab.log(e.details, kind="error")
             messagebox.showerror("Σφάλμα", e.details)
         except Exception as e:
-            tab.log(str(e), kind="error")
-            messagebox.showerror("Σφάλμα", str(e))
-    
-    def on_export_current_word(self):
+            import traceback
+            full = traceback.format_exc()
+            tab.log(f"⚠️ ΕΣΩΤΕΡΙΚΟ ΣΦΑΛΜΑ:\n{full}", kind="error")
+            messagebox.showerror("Σφάλμα", f"Εσωτερικό σφάλμα:\n{str(e)}\n\nΔείτε το log για λεπτομέρειες.")
+
+    def on_save_current_schedule(self):
+        """Save current tab's schedule to history and state."""
         try:
             year, month, extra = self.get_shared_settings()
-            
             key = self.current_tab_key()
             tab = self.tabs[key]
             if not tab.current_schedule:
                 raise RuntimeError("Δεν υπάρχει πρόγραμμα.")
             
-            default_name = f"{key}_{month:02d}_{year}.docx"
-            path = filedialog.asksaveasfilename(
-                defaultextension=".docx",
-                filetypes=[("Word Document", "*.docx")],
-                initialfile=default_name,
-                title="Αποθήκευση Word",
-            )
-            if not path:
-                return
-            
-            export_schedule_to_word(
-                filepath=path,
-                tab_key=key,
+            add_to_history(
                 year=year,
                 month=month,
+                tab_key=key,
                 schedule=tab.current_schedule,
-                extra_holidays=extra,
                 ranks=tab.current_ranks,
+                extra_holidays=extra,
             )
-            messagebox.showinfo("OK", f"Έγινε export:\n{path}")
-        
+            self.save_state()
+            self.save_schedule_state()
+            messagebox.showinfo("Αποθήκευση", f"✅ Αποθηκεύτηκε το πρόγραμμα {TAB_TITLES.get(key, key)}!")
         except Exception as e:
             messagebox.showerror("Σφάλμα", str(e))
-    
+
+
+    def on_manual_save_state(self):
+        """Manually save the current application state to JSON."""
+        self.save_state()
+        self.save_schedule_state()
+        messagebox.showinfo("Αποθήκευση", "✅ Το state αποθηκεύτηκε!")
+        
     def save_state(self):
+        """Αποθηκεύει ΜΟΝΟ τα inputs (άτομα, ρυθμίσεις) - καλείται στο κλείσιμο και αυτόματα."""
         try:
-            state = {
+            people_state = {
                 "year": safe_int(self.year_var.get(), 2026),
                 "month": safe_int(self.month_var.get(), 3),
                 "extra": self.extra_var.get().strip(),
@@ -2861,44 +3188,94 @@ class SchedulerApp(tk.Tk):
                 "tabs": {},
             }
             for key in TAB_KEYS:
-                state["tabs"][key] = self.tabs[key].get_tab_state()
+                tab_state = self.tabs[key].get_tab_state()
+                # Αποθήκευσε ΜΟΝΟ τα people inputs, όχι το schedule
+                people_state["tabs"][key] = {
+                    "count": tab_state.get("count", 1),
+                    "people": tab_state.get("people", []),
+                }
             
             with open(get_state_path(), "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=False, indent=2)
+                json.dump(people_state, f, ensure_ascii=False, indent=2)
+        except Exception:
+            return
+
+    def save_schedule_state(self):
+        """Αποθηκεύει τα παραγόμενα προγράμματα - καλείται ΜΟΝΟ χειροκίνητα."""
+        try:
+            schedule_state = {"tabs": {}}
+            for key in TAB_KEYS:
+                tab_state = self.tabs[key].get_tab_state()
+                # Αποθήκευσε ΜΟΝΟ τα schedule data
+                sched_data = {}
+                if "saved_schedule" in tab_state:
+                    sched_data["saved_schedule"] = tab_state["saved_schedule"]
+                if "saved_ranks" in tab_state:
+                    sched_data["saved_ranks"] = tab_state["saved_ranks"]
+                if "saved_stats_text" in tab_state:
+                    sched_data["saved_stats_text"] = tab_state["saved_stats_text"]
+                if sched_data:
+                    schedule_state["tabs"][key] = sched_data
+            
+            with open(get_schedule_path(), "w", encoding="utf-8") as f:
+                json.dump(schedule_state, f, ensure_ascii=False, indent=2)
         except Exception:
             return
     
     def load_state(self):
-        """Load state from JSON."""
-        path = get_state_path()
-        if not os.path.exists(path):
-            return
-        
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                state = json.load(f)
-            
-            # Restore year, month, extra
-            if "year" in state:
-                self.year_var.set(str(state["year"]))
-            if "month" in state:
-                self.month_var.set(str(state["month"]))
-            if "extra" in state:
-                self.extra_var.set(state["extra"])
-            
-            # Restore tab states
-            if "tabs" in state:
-                for key in TAB_KEYS:
-                    if key in state["tabs"]:
-                        self.tabs[key].set_tab_state(state["tabs"][key])
-            
-            # Restore active tab
-            if "active_tab" in state and state["active_tab"] in TAB_KEYS:
-                self.notebook.select(TAB_KEYS.index(state["active_tab"]))
+        """Φορτώνει inputs από scheduler_people.json και προγράμματα από scheduler_schedule.json."""
+        # --- Φόρτωση inputs (people) ---
+        people_path = get_state_path()
+        if os.path.exists(people_path):
+            try:
+                with open(people_path, "r", encoding="utf-8") as f:
+                    state = json.load(f)
                 
-        except Exception as e:
-            # Silently fail if there's an error loading state
-            pass
+                if "year" in state:
+                    self.year_var.set(str(state["year"]))
+                if "month" in state:
+                    self.month_var.set(str(state["month"]))
+                if "extra" in state:
+                    self.extra_var.set(state["extra"])
+                
+                if "tabs" in state:
+                    for key in TAB_KEYS:
+                        if key in state["tabs"]:
+                            self.tabs[key].set_tab_state(state["tabs"][key])
+                
+                if "active_tab" in state and state["active_tab"] in TAB_KEYS:
+                    self.nb.select(TAB_KEYS.index(state["active_tab"]))
+            except Exception:
+                pass
+        
+        # --- Φόρτωση προγραμμάτων (schedule) ---
+        schedule_path = get_schedule_path()
+        if os.path.exists(schedule_path):
+            try:
+                with open(schedule_path, "r", encoding="utf-8") as f:
+                    sched_state = json.load(f)
+                
+                if "tabs" in sched_state:
+                    for key in TAB_KEYS:
+                        if key in sched_state["tabs"]:
+                            # Φόρτωσε μόνο το schedule, χωρίς να πειράξεις τα people inputs
+                            sched_data = sched_state["tabs"][key]
+                            tab = self.tabs[key]
+                            if "saved_schedule" in sched_data and sched_data["saved_schedule"]:
+                                tab.current_schedule = {int(k): v for k, v in sched_data["saved_schedule"].items()}
+                                tab.current_ranks = sched_data.get("saved_ranks", {})
+                                saved_text = sched_data.get("saved_stats_text", "")
+                                if saved_text:
+                                    try:
+                                        tab.stats.config(state="normal")
+                                        tab.stats.delete("1.0", "end")
+                                        tab.stats.insert("end", saved_text)
+                                        tab.stats.config(state="disabled")
+                                        tab.export_btn.config(state="normal")
+                                    except Exception:
+                                        pass
+            except Exception:
+                pass
     
     # History Management Methods
     def on_edit_history(self):
@@ -3072,6 +3449,8 @@ class HistoryViewerEditorDialog(tk.Toplevel):
                 continue
             
             for person, data in year_data[month_str].items():
+                if person.startswith("_"):  # παράλειψε internal keys όπως _saved_tabs
+                    continue
                 if person not in totals:
                     totals[person] = {
                         "weekday": 0,
@@ -3139,6 +3518,8 @@ class HistoryViewerEditorDialog(tk.Toplevel):
         others = []
         
         for person, data in people_data.items():
+            if person.startswith("_"):  # παράλειψε internal keys όπως _saved_tabs
+                continue
             rank = data.get("rank", "")
             # Check if rank contains officer title
             if any(suffix in rank.upper() for suffix in ["ΛΓΟΣ", "ΥΠΛΓΟΣ", "ΑΝΘΛΓΟΣ"]):
@@ -3147,7 +3528,7 @@ class HistoryViewerEditorDialog(tk.Toplevel):
                 others.append((person, data))
         
         month_data["stats_label"].config(
-            text=f"📅 {month_name} {year}: {len(people_data)} άτομα (Αξ: {len(officers)}, Λοιποί: {len(others)})"
+            text=f"📅 {month_name} {year}: {len(officers)+len(others)} άτομα (Αξ: {len(officers)}, Λοιποί: {len(others)})"
         )
         
         # Display Officers
@@ -3259,294 +3640,6 @@ class HistoryViewerEditorDialog(tk.Toplevel):
         save_history(history)
         messagebox.showinfo("Επιτυχία", f"Όλα τα δεδομένα αποθηκεύτηκαν!")
     
-    def _build_ui(self):
-        root = ttk.Frame(self, padding=10)
-        root.pack(fill="both", expand=True)
-        
-        top = ttk.LabelFrame(root, text="Κοινές Ρυθμίσεις (για ΟΛΑ τα φύλλα)", padding=10)
-        top.pack(fill="x", pady=(0, 10))
-        
-        ttk.Label(top, text="Έτος:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(top, textvariable=self.year_var, width=10).grid(row=0, column=1, sticky="w", padx=(6, 12))
-        
-        ttk.Label(top, text="Μήνας (1-12):").grid(row=0, column=2, sticky="w")
-        ttk.Entry(top, textvariable=self.month_var, width=10).grid(row=0, column=3, sticky="w", padx=(6, 12))
-        
-        ttk.Label(top, text="Extra αργίες (πχ 25 ή 6,25 ή 6-10):").grid(row=0, column=4, sticky="w")
-        ttk.Entry(top, textvariable=self.extra_var, width=18).grid(row=0, column=5, sticky="w", padx=(6, 12))
-        
-        # Unified "Generate All" button
-        ttk.Button(top, text="🌐 Δημιουργία ΟΛΩΝ", command=self.on_generate_all_unified).grid(
-            row=0, column=6, sticky="w", padx=(12, 6)
-        )
-        
-        # Export All button
-        ttk.Button(top, text="📄 Export ΟΛΩΝ", command=self.on_export_all_word).grid(
-            row=0, column=7, sticky="w", padx=(0, 12)
-        )
-        
-        solver_status = "🎯 Backtracking Solver"
-        ttk.Label(top, text=solver_status, foreground="blue").grid(
-            row=0, column=8, sticky="w", padx=(12, 0)
-        )
-        
-        self.nb = ttk.Notebook(root)
-        self.nb.pack(fill="both", expand=True)
-        
-        self.tabs: dict[str, PeopleTab] = {}
-        for key in TAB_KEYS:
-            tab = PeopleTab(self.nb, tab_key=key, app_ref=self)
-            self.nb.add(tab, text=TAB_TITLES.get(key, key))
-            self.tabs[key] = tab
-    
-    def current_tab_key(self) -> str:
-        idx = self.nb.index(self.nb.select())
-        return TAB_KEYS[idx]
-    
-    def get_shared_settings(self):
-        year = safe_int(self.year_var.get(), 2026)
-        month = safe_int(self.month_var.get(), 3)
-        if month < 1 or month > 12:
-            raise ValueError("Ο μήνας πρέπει να είναι 1-12.")
-        _, dim = calendar.monthrange(year, month)
-        extra = parse_days_list(self.extra_var.get(), dim)
-        return year, month, extra
-    
-    def on_generate_all_unified(self):
-        """Generate all tabs together (unified scheduling to avoid conflicts)."""
-        year, month, extra = self.get_shared_settings()
-        _, days_in_month = calendar.monthrange(year, month)
-        
-        # Collect data from all tabs
-        all_tabs_data = {}
-        for key in TAB_KEYS:
-            try:
-                # Call parse_people directly with days_in_month
-                names, leaves, ranks, max_caps, preferences = self.tabs[key].parse_people(days_in_month)
-                if names:  # Only include non-empty tabs
-                    all_tabs_data[key] = {
-                        "names": names,
-                        "leaves": leaves,
-                        "ranks": ranks,
-                        "max_caps": max_caps,
-                        "preferences": preferences,
-                    }
-            except Exception as e:
-                messagebox.showerror("Σφάλμα", f"Σφάλμα στο {TAB_TITLES[key]}: {str(e)}")
-                return
-        
-        if not all_tabs_data:
-            messagebox.showwarning("Προσοχή", "Δεν υπάρχουν δεδομένα σε κανένα tab!")
-            return
-        
-        # Clear all tabs first
-        for tab in self.tabs.values():
-            tab.clear_program_view()
-        
-        # Run unified scheduling
-        try:
-            results = solve_all_tabs_unified(
-                all_tabs_data=all_tabs_data,
-                year=year,
-                month=month,
-                extra_holidays=extra,
-                log_cb=lambda m: None,  # Silent - no terminal spam
-            )
-            
-            # Display results in each tab
-            for key, (schedule, quotas, meta, solve_info) in results.items():
-                self.tabs[key].render_program(year, month, extra, schedule, 
-                                              all_tabs_data[key]["ranks"], quotas, meta, solve_info)
-            
-            messagebox.showinfo("Επιτυχία", 
-                              f"Δημιουργήθηκαν {len(results)} προγράμματα χωρίς συγκρούσεις!")
-            
-        except ScheduleError as e:
-            messagebox.showerror("Αδύνατο πρόγραμμα", f"{e.message}\n\n{e.details}")
-        except Exception as e:
-            messagebox.showerror("Σφάλμα", f"Απρόσμενο σφάλμα:\n{str(e)}")
-    
-    def on_export_all_word(self):
-        """Export all tabs to a single Word file (4 pages)."""
-        year, month, extra = self.get_shared_settings()
-        
-        # Collect data from all tabs that have schedules
-        export_data = []
-        for key in TAB_KEYS:
-            if self.tabs[key].current_schedule:
-                export_data.append({
-                    "tab_key": key,
-                    "schedule": self.tabs[key].current_schedule,
-                    "ranks": self.tabs[key].current_ranks,
-                })
-        
-        if not export_data:
-            messagebox.showwarning("Προσοχή", "Δεν υπάρχουν προγράμματα για export!")
-            return
-        
-        # Ask for filename
-        default_name = f"Προγραμματα_{GREEK_MONTHS_GEN[month]}_{year}.docx"
-        filepath = filedialog.asksaveasfilename(
-            defaultextension=".docx",
-            filetypes=[("Word Documents", "*.docx")],
-            initialfile=default_name
-        )
-        
-        if not filepath:
-            return
-        
-        try:
-            export_all_schedules_to_word(
-                filepath=filepath,
-                export_data=export_data,
-                year=year,
-                month=month,
-                extra_holidays=extra,
-            )
-            
-            # AUTO-SAVE TO HISTORY after successful export
-            for data in export_data:
-                try:
-                    add_to_history(
-                        year=year,
-                        month=month,
-                        tab_key=data["tab_key"],
-                        schedule=data["schedule"],
-                        ranks=data["ranks"],  # NEW: pass ranks
-                        extra_holidays=extra,
-                    )
-                except Exception as e:
-                    print(f"Warning: Could not save {data['tab_key']} to history: {e}")
-            
-            messagebox.showinfo(
-                "Επιτυχία", 
-                f"Εξαγωγή σε:\n{filepath}\n\n✅ Αποθηκεύτηκε στο ιστορικό!"
-            )
-        except Exception as e:
-            messagebox.showerror("Σφάλμα", f"Αποτυχία εξαγωγής:\n{str(e)}")
-    
-    def on_generate_current(self):
-        key = self.current_tab_key()
-        tab = self.tabs[key]
-        try:
-            year, month, extra = self.get_shared_settings()
-            _, dim = calendar.monthrange(year, month)
-            
-            tab.clear_program_view()
-            tab.log("----- Νέα εκτέλεση -----")
-            
-            names, leaves, ranks, max_caps, preferences = tab.parse_people(dim)
-            
-            sched, quotas, meta, solve_info = solve_schedule_best_effort(
-                names=names,
-                year=year,
-                month=month,
-                extra_holidays=extra,
-                leaves=leaves,
-                preferences=preferences,  # NEW: pass preferences
-                max_caps=max_caps,
-                ranks=ranks,  # NEW: pass ranks for group balancing
-                tab_key=key,
-                log_cb=lambda m: tab.log(m, kind="info"),
-            )
-            
-            tab.render_program(year, month, extra, sched, ranks, quotas, meta, solve_info)
-            self.save_state()
-            messagebox.showinfo("OK", "Βγήκε νέο πρόγραμμα ✅")
-        
-        except ScheduleError as e:
-            tab.log(e.details, kind="error")
-            messagebox.showerror("Σφάλμα", e.details)
-        except Exception as e:
-            tab.log(str(e), kind="error")
-            messagebox.showerror("Σφάλμα", str(e))
-    
-    def on_export_current_word(self):
-        try:
-            year, month, extra = self.get_shared_settings()
-            
-            key = self.current_tab_key()
-            tab = self.tabs[key]
-            if not tab.current_schedule:
-                raise RuntimeError("Δεν υπάρχει πρόγραμμα.")
-            
-            default_name = f"{key}_{month:02d}_{year}.docx"
-            path = filedialog.asksaveasfilename(
-                defaultextension=".docx",
-                filetypes=[("Word Document", "*.docx")],
-                initialfile=default_name,
-                title="Αποθήκευση Word",
-            )
-            if not path:
-                return
-            
-            export_schedule_to_word(
-                filepath=path,
-                tab_key=key,
-                year=year,
-                month=month,
-                schedule=tab.current_schedule,
-                extra_holidays=extra,
-                ranks=tab.current_ranks,
-            )
-            messagebox.showinfo("OK", f"Έγινε export:\n{path}")
-        
-        except Exception as e:
-            messagebox.showerror("Σφάλμα", str(e))
-    
-    def save_state(self):
-        try:
-            state = {
-                "year": safe_int(self.year_var.get(), 2026),
-                "month": safe_int(self.month_var.get(), 3),
-                "extra": self.extra_var.get().strip(),
-                "active_tab": self.current_tab_key(),
-                "tabs": {},
-            }
-            for key in TAB_KEYS:
-                state["tabs"][key] = self.tabs[key].get_tab_state()
-            
-            with open(get_state_path(), "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=False, indent=2)
-        except Exception:
-            return
-    
-    def load_state(self):
-        path = get_state_path()
-        if not os.path.exists(path):
-            for key in TAB_KEYS:
-                self.tabs[key].set_tab_state({"count": 1, "people": [{"rank": "", "name": "", "max": "", "leave": "", "preference": ""}]})
-            return
-        
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                state = json.load(f)
-            
-            self.year_var.set(str(state.get("year", 2026)))
-            self.month_var.set(str(state.get("month", 3)))
-            self.extra_var.set(str(state.get("extra", "")))
-            
-            tabs_state = state.get("tabs", {})
-            if not isinstance(tabs_state, dict):
-                tabs_state = {}
-            
-            for key in TAB_KEYS:
-                ts = tabs_state.get(key)
-                if isinstance(ts, dict):
-                    self.tabs[key].set_tab_state(ts)
-                else:
-                    self.tabs[key].set_tab_state({"count": 1, "people": [{"rank": "", "name": "", "max": "", "leave": "", "preference": ""}]})
-            
-            active = state.get("active_tab", "AYDM")
-            if active in TAB_KEYS:
-                self.nb.select(TAB_KEYS.index(active))
-        
-        except Exception:
-            for key in TAB_KEYS:
-                self.tabs[key].set_tab_state({"count": 1, "people": [{"rank": "", "name": "", "max": "", "leave": "", "preference": ""}]})
-            return
-    
-
 
 if __name__ == "__main__":
     app = SchedulerApp()
