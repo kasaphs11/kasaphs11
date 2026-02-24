@@ -1,16 +1,29 @@
-## Hi there 👋
+# Hi, I'm Stefanos 👋
 
-<!--
-**kasaphs11/kasaphs11** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
+Python Developer specialized in **Automation, GUI Applications, and Data Processing**.
 
-Here are some ideas to get you started:
+I build custom tools that help businesses and organizations save time and reduce manual work.
 
-- 🔭 I’m currently working on ...
-- 🌱 I’m currently learning ...
-- 👯 I’m looking to collaborate on ...
-- 🤔 I’m looking for help with ...
-- 💬 Ask me about ...
-- 📫 How to reach me: ...
-- 😄 Pronouns: ...
-- ⚡ Fun fact: ...
--->
+---
+
+## 💼 What I Do
+
+- 🤖 Automation Scripts & Bots
+- 📊 Excel & Data Processing
+- 🖥️ Python GUI Applications
+- 📄 Reporting Tools
+- 🎮 Game Dev
+
+## 🛠️ Tech Stack
+
+- Python
+- C, C++, C#
+- Javascript
+  
+---
+
+## 📬 Contact
+
+Available for freelance work.
+
+Feel free to reach out.
