@@ -39,6 +39,67 @@ TAB_TITLES = {
     "PYLI": "ΠΥΛΗ",
 }
 
+def cross_tab_blocked_days(
+    assigned_days: set,
+    source_tab: str,
+    year: int,
+    month: int,
+) -> set:
+    """
+    Για κάθε μέρα που έχει ήδη ανατεθεί σε άλλο tab, υπολογίζει
+    όλες τις blocked μέρες για το τρέχον tab:
+      - Η ίδια η μέρα
+      - Gap=2 (±2 μέρες)
+      - Weekend rules (Παρ/Σαβ extended gap ανά service)
+    """
+    import datetime as _dt
+    import calendar as _cal
+    _, dim = _cal.monthrange(year, month)
+
+    # Weekend gap ανά service
+    req_fri = 3 if source_tab in ("AYDM", "PYLI") else 4
+    req_sat = 4 if source_tab in ("AYDM", "PYLI") else 5
+
+    blocked = set()
+    for aday in assigned_days:
+        # Ίδια μέρα + gap=2
+        for delta in range(-MIN_GAP_STRICT, MIN_GAP_STRICT + 1):
+            d = aday + delta
+            if 1 <= d <= dim:
+                blocked.add(d)
+
+        # Weekend rules
+        try:
+            wd = _dt.date(year, month, aday).weekday()
+        except ValueError:
+            continue
+
+        if wd == 4:  # Παρασκευή → block τις επόμενες req_fri μέρες
+            for d in range(aday + 1, aday + req_fri + 1):
+                if 1 <= d <= dim:
+                    blocked.add(d)
+        elif wd == 5:  # Σάββατο → block τις επόμενες req_sat μέρες
+            for d in range(aday + 1, aday + req_sat + 1):
+                if 1 <= d <= dim:
+                    blocked.add(d)
+
+        # Και προς τα πίσω: αν η aday ακολουθεί Παρ/Σαβ
+        for delta in range(1, req_sat + 1):
+            prev = aday - delta
+            if 1 <= prev <= dim:
+                try:
+                    wd_prev = _dt.date(year, month, prev).weekday()
+                except ValueError:
+                    continue
+                if wd_prev == 4 and delta <= req_fri:
+                    blocked.add(prev)
+                elif wd_prev == 5 and delta <= req_sat:
+                    blocked.add(prev)
+
+    return blocked
+
+
+
 GREEK_MONTHS_GEN = {
     1: "ΙΑΝΟΥΑΡΙΟΥ", 2: "ΦΕΒΡΟΥΑΡΙΟΥ", 3: "ΜΑΡΤΙΟΥ", 4: "ΑΠΡΙΛΙΟΥ",
     5: "ΜΑΪΟΥ", 6: "ΙΟΥΝΙΟΥ", 7: "ΙΟΥΛΙΟΥ", 8: "ΑΥΓΟΥΣΤΟΥ",
@@ -54,6 +115,37 @@ GREEK_MONTH_ABBR = {
 # -----------------------------
 # Persistence
 # -----------------------------
+
+def compute_cross_tab_counts(
+    names: list,
+    other_schedules: dict,   # {tab_key: {day: person}}
+    year: int,
+    month: int,
+    extra_holidays: set,
+) -> tuple[dict, dict]:
+    """
+    Μετράει για κάθε άτομο πόσες αργίες και Παρασκευές έχει ήδη
+    σε άλλα tabs (ώστε να αφαιρεθούν από το quota του τρέχοντος tab).
+    """
+    import datetime as _dt
+    cross_hol = {p: 0 for p in names}
+    cross_fri = {p: 0 for p in names}
+    for tab_key, sched in other_schedules.items():
+        for day_str, person in sched.items():
+            if person not in names:
+                continue
+            d = int(day_str)
+            try:
+                wd = _dt.date(year, month, d).weekday()
+            except ValueError:
+                continue
+            if d in extra_holidays or wd >= 5:
+                cross_hol[person] = cross_hol.get(person, 0) + 1
+            if wd == 4:
+                cross_fri[person] = cross_fri.get(person, 0) + 1
+    return cross_hol, cross_fri
+
+
 def get_base_dir() -> str:
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
@@ -1097,38 +1189,60 @@ def solve_all_tabs_unified(
     _emit(None, "="*60)
     
     results = {}
-    global_assignments = {}  # {person: set of days already assigned}
-    
+    # {person: {tab_key: set_of_days}} — παρακολούθηση ανά tab για σωστό weekend blocking
+    global_assignments = {}  # {person: {source_tab: set_of_days}}
+
     # Process each tab in order (ΑΥΔΜ, ΒΑΥΔΜ, ΦΚΧ, ΠΥΛΗ)
     for tab_key in TAB_KEYS:
         if tab_key not in all_tabs_data:
             continue
-        
+
         tab_data = all_tabs_data[tab_key]
         names = tab_data["names"]
         leaves = tab_data["leaves"]
         ranks = tab_data["ranks"]
         max_caps = tab_data["max_caps"]
-        preferences = tab_data.get("preferences", {})  # NEW: get preferences
-        
+        preferences = tab_data.get("preferences", {})
+
         if not names:
             continue
-        
+
         _emit(tab_key, f"\n📋 {TAB_TITLES[tab_key]}...")
-        
-        # Add previous assignments to leaves (cross-tab conflict prevention)
+
+        # Cross-tab blocking: ίδια μέρα + gap=2 + weekend rules
         extended_leaves = {}
         for person in names:
             person_leaves = set(leaves.get(person, set()))
-            
+
             if person in global_assignments:
-                already_assigned = global_assignments[person]
-                person_leaves.update(already_assigned)
-                _emit(tab_key, f"  ⚠️  {person} ήδη ανατεθειμένος σε: {sorted(already_assigned)}")
-            
+                for src_tab, src_days in global_assignments[person].items():
+                    blocked = cross_tab_blocked_days(src_days, src_tab, year, month)
+                    extra_blocked = blocked - src_days  # μόνο τα επιπλέον (για log)
+                    person_leaves.update(blocked)
+                _emit(tab_key, f"  ⚠️  {person}: cross-tab blocked {sorted(person_leaves - leaves.get(person, set()))}")
+
             extended_leaves[person] = person_leaves
-        
-        # Solve this tab (uses history only, no running totals)
+
+        # Υπολογισμός cross-tab αργιών/Παρασκευών για quota balancing
+        other_scheds = {}
+        for src_tab, src_data in global_assignments.items():
+            # global_assignments: {person: {tab: set_of_days}}
+            pass
+        # Φτιάξε {tab: {day_str: person}} από global_assignments
+        _other_scheds = {}
+        for person, tab_days in global_assignments.items():
+            for src_tab, days in tab_days.items():
+                if src_tab not in _other_scheds:
+                    _other_scheds[src_tab] = {}
+                for d in days:
+                    _other_scheds[src_tab][str(d)] = person
+        cross_hol, cross_fri = compute_cross_tab_counts(
+            names, _other_scheds, year, month, extra_holidays
+        )
+        if any(v > 0 for v in cross_hol.values()):
+            _emit(tab_key, f"  📊 Cross-tab αργίες: { {p:v for p,v in cross_hol.items() if v>0} }")
+
+        # Solve this tab
         try:
             schedule, quotas, meta, solve_info = solve_schedule_best_effort(
                 names=names,
@@ -1136,18 +1250,22 @@ def solve_all_tabs_unified(
                 month=month,
                 extra_holidays=extra_holidays,
                 leaves=extended_leaves,
-                preferences=preferences,  # NEW: pass preferences
+                preferences=preferences,
                 max_caps=max_caps,
                 ranks=ranks,
                 tab_key=tab_key,
                 log_cb=lambda m, tk=tab_key: _emit(tk, f"    {m}"),
+                cross_tab_holidays=cross_hol,
+                cross_tab_fridays=cross_fri,
             )
-            
+
             # Update global assignments
             for day, person in schedule.items():
                 if person not in global_assignments:
-                    global_assignments[person] = set()
-                global_assignments[person].add(day)
+                    global_assignments[person] = {}
+                if tab_key not in global_assignments[person]:
+                    global_assignments[person][tab_key] = set()
+                global_assignments[person][tab_key].add(day)
             
             results[tab_key] = (schedule, quotas, meta, solve_info)
             _emit(tab_key, f"  ✅ {TAB_TITLES[tab_key]} ολοκληρώθηκε")
@@ -1613,11 +1731,13 @@ def solve_schedule_best_effort(
     month: int,
     extra_holidays: set[int],
     leaves: dict[str, set[int]],
-    preferences: dict[str, set[int]] = None,  # soft preferences
+    preferences: dict[str, set[int]] = None,
     max_caps: dict[str, int] | None = None,
     ranks: dict[str, str] | None = None,
     tab_key: str = "AYDM",
     log_cb=None,
+    cross_tab_holidays: dict[str, int] | None = None,  # αργίες από άλλα tabs
+    cross_tab_fridays: dict[str, int] | None = None,   # Παρασκευές από άλλα tabs
 ) -> tuple[dict[int, str], dict[str, int], dict, dict]:
     """
     Main solver with two-phase strategy and score balancing.
@@ -1632,6 +1752,11 @@ def solve_schedule_best_effort(
 
     if log_cb is None:
         log_cb = lambda m: print(m)
+
+    if cross_tab_holidays is None:
+        cross_tab_holidays = {}
+    if cross_tab_fridays is None:
+        cross_tab_fridays = {}
 
     if preferences is None:
         preferences = {}
@@ -1751,34 +1876,78 @@ def solve_schedule_best_effort(
         quotas: dict[str, int],
         forced_holiday_counts: dict[str, int],
     ) -> dict[str, int]:
-        """Holiday quotas for the *remaining* assignments.
+        """Holiday quotas για τις υπολειπόμενες αναθέσεις.
 
-        We compute fair holiday quotas for the whole month (history-aware),
-        then subtract already-forced holiday assignments from preferences.
+        Υπολογίζει fair quotas αφαιρώντας:
+        - Αργίες που δόθηκαν ήδη μέσω forced pre-assignments (επιθυμίες)
+        - Αργίες που έχει ήδη ο άνθρωπος από ΑΛΛΑ tabs (cross-tab)
+
+        Για τα cross-tab: μειώνει τόσο το quota του ατόμου ΟΣΟ και το
+        total_holidays που μοιράζεται, ώστε τα υπόλοιπα quotas να είναι συνεπή.
         """
         cumulative_stats = calculate_cumulative_stats(year, month, tab_key, names)
-        holiday_quotas_total = compute_holiday_quotas_with_history(
-            names, total_holidays, cumulative_stats, ranks, rng,
-            leaves=leaves,
-            year=year,
-            month=month,
-            extra_holidays=extra_holidays,
-        )
 
-        # Subtract forced holiday assignments
+        # Υπολόγισε πόσες αργίες "καταλαμβάνει" το cross-tab για αυτό το tab
+        # (μόνο για άτομα που υπάρχουν εδώ)
+        total_cross_hols = sum(
+            min(int(cross_tab_holidays.get(p, 0)), int(quotas.get(p, 0)))
+            for p in names
+        )
+        # Οι αργίες που πραγματικά πρέπει να μοιραστούν σε αυτό το tab
+        effective_total_holidays = max(0, total_holidays - total_cross_hols)
+
+        # Υπολόγισε quotas για τα άτομα χωρίς cross-tab αργίες
+        names_for_quota = [p for p in names if cross_tab_holidays.get(p, 0) == 0]
+        if names_for_quota:
+            holiday_quotas_base = compute_holiday_quotas_with_history(
+                names_for_quota, effective_total_holidays, cumulative_stats, ranks, rng,
+                leaves=leaves, year=year, month=month, extra_holidays=extra_holidays,
+            )
+        else:
+            holiday_quotas_base = {}
+
+        # Βήμα 1: δώσε 0 στους cross-tab, κανονικά στους υπόλοιπους
         holiday_quotas: dict[str, int] = {}
         for p in names:
+            cross_h  = int(cross_tab_holidays.get(p, 0))
             forced_h = int(forced_holiday_counts.get(p, 0))
-            q_total = int(holiday_quotas_total.get(p, 0))
-            q_remaining = max(0, q_total - forced_h)
-
-            # Clamp by remaining total quotas (can't have more holidays than remaining assignments)
             qp = int(quotas.get(p, 0))
-            q_remaining = min(q_remaining, qp)
-            if qp <= 0:
-                q_remaining = 0
 
-            holiday_quotas[p] = q_remaining
+            if cross_h > 0:
+                holiday_quotas[p] = 0
+            else:
+                q_total = int(holiday_quotas_base.get(p, 0))
+                q_remaining = max(0, q_total - forced_h)
+                q_remaining = min(q_remaining, qp)
+                if qp <= 0:
+                    q_remaining = 0
+                holiday_quotas[p] = q_remaining
+
+        # Βήμα 2: αν τα quotas δεν φτάνουν για να καλύψουν τις αργίες,
+        # διανέμουμε τις επιπλέον αργίες round-robin σε όσους έχουν χώρο
+        # (συμπεριλαμβανομένων των cross-tab ατόμων ως τελευταία επιλογή)
+        total_hq = sum(holiday_quotas.values())
+        if total_hq < total_holidays:
+            shortfall = total_holidays - total_hq
+            # Πρώτα: άτομα χωρίς cross-tab που έχουν ακόμα χώρο
+            eligible = [p for p in names
+                        if cross_tab_holidays.get(p, 0) == 0
+                        and holiday_quotas.get(p, 0) < quotas.get(p, 0)]
+            eligible.sort(key=lambda p: holiday_quotas.get(p, 0))
+            for p in eligible:
+                if shortfall <= 0: break
+                holiday_quotas[p] += 1
+                shortfall -= 1
+            # Αν ακόμα δεν φτάνει: cross-tab άτομα (ανάγκη)
+            if shortfall > 0:
+                cross_eligible = [p for p in names
+                                   if cross_tab_holidays.get(p, 0) > 0
+                                   and holiday_quotas.get(p, 0) < quotas.get(p, 0)]
+                cross_eligible.sort(key=lambda p: holiday_quotas.get(p, 0))
+                for p in cross_eligible:
+                    if shortfall <= 0: break
+                    holiday_quotas[p] += 1
+                    shortfall -= 1
 
         return holiday_quotas
 
@@ -1801,9 +1970,9 @@ def solve_schedule_best_effort(
         friday_quotas: dict[str, int] = {}
         for p in names:
             forced_f = int(forced_friday_counts.get(p, 0))
-            q_total = int(friday_quotas_total.get(p, 0))
-            q_remaining = max(0, q_total - forced_f)
-            # Clamp by remaining total quotas
+            cross_f  = int(cross_tab_fridays.get(p, 0))
+            q_total  = int(friday_quotas_total.get(p, 0))
+            q_remaining = max(0, q_total - forced_f - cross_f)
             qp = int(quotas.get(p, 0))
             q_remaining = min(q_remaining, qp)
             if qp <= 0:
@@ -2959,10 +3128,12 @@ class SchedulerApp(tk.Tk):
             row=0, column=7, sticky="w", padx=(0, 12)
         )
         
-        solver_status = "🎯 Backtracking Solver"
+        solver_status = "Στέφανος Κασάπης +30 6986738750"
         ttk.Label(top, text=solver_status, foreground="blue").grid(
             row=0, column=8, sticky="w", padx=(12, 0)
         )
+
+
         
         self.nb = ttk.Notebook(root)
         self.nb.pack(fill="both", expand=True)
@@ -3116,23 +3287,60 @@ class SchedulerApp(tk.Tk):
         try:
             year, month, extra = self.get_shared_settings()
             _, dim = calendar.monthrange(year, month)
-            
+
             tab.clear_program_view()
             tab.log("----- Νέα εκτέλεση -----")
-            
+
             names, leaves, ranks, max_caps, preferences = tab.parse_people(dim)
-            
+
+            # Cross-tab blocking από schedules άλλων tabs
+            extended_leaves = {}
+            for person in names:
+                person_leaves = set(leaves.get(person, set()))
+                for other_key in TAB_KEYS:
+                    if other_key == key:
+                        continue
+                    other_sched = self.tabs[other_key].current_schedule
+                    if not other_sched:
+                        continue
+                    # Βρες τις μέρες που ο person δουλεύει στο άλλο tab
+                    other_days = {d for d, p in other_sched.items() if p == person}
+                    if not other_days:
+                        continue
+                    blocked = cross_tab_blocked_days(other_days, other_key, year, month)
+                    extra_blocked = blocked - other_days
+                    person_leaves.update(blocked)
+                    tab.log(f"  ⚠️  {person}: cross-tab {other_key} μέρες {sorted(other_days)}, blocked +{sorted(extra_blocked)}", kind="info")
+                extended_leaves[person] = person_leaves
+
+            # Υπολογισμός cross-tab αργιών/Παρασκευών από saved schedules άλλων tabs
+            _other_scheds = {}
+            for other_key in TAB_KEYS:
+                if other_key == key:
+                    continue
+                other_sched = self.tabs[other_key].current_schedule
+                if not other_sched:
+                    continue
+                _other_scheds[other_key] = {str(d): p for d, p in other_sched.items()}
+            cross_hol, cross_fri = compute_cross_tab_counts(
+                names, _other_scheds, year, month, extra
+            )
+            if any(v > 0 for v in cross_hol.values()):
+                tab.log(f"  📊 Cross-tab αργίες: { {p:v for p,v in cross_hol.items() if v>0} }", kind="info")
+
             sched, quotas, meta, solve_info = solve_schedule_best_effort(
                 names=names,
                 year=year,
                 month=month,
                 extra_holidays=extra,
-                leaves=leaves,
-                preferences=preferences,  # NEW: pass preferences
+                leaves=extended_leaves,
+                preferences=preferences,
                 max_caps=max_caps,
-                ranks=ranks,  # NEW: pass ranks for group balancing
+                ranks=ranks,
                 tab_key=key,
                 log_cb=lambda m: tab.log(m, kind="info"),
+                cross_tab_holidays=cross_hol,
+                cross_tab_fridays=cross_fri,
             )
             
             tab.render_program(year, month, extra, sched, ranks, quotas, meta, solve_info)
