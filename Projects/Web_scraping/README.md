@@ -39,3 +39,65 @@ If similarity is below threshold → marked as `LOW_SIM`.
 
 ---
 
+## 📊 Excel Integration
+
+### 📥 Input File
+
+The input file (`ΤΙΜΕΣ.xlsx`) is an Excel spreadsheet containing product names of alcoholic beverages (e.g. whisky, vodka, rum, etc.).
+
+The required column is:
+
+- **Ονομασία Εμπορεύματος** → The product name to be searched.
+
+Each row represents a product.
+
+The script automatically reads all rows and processes only products that do not already have a price filled.
+
+---
+### 📤 Output File
+
+The output file (`ΤΙΜΕΣ_ΕΛΛΑΔΑ_bestprice.xlsx`) is continuously updated in-place.
+
+If the file already exists, the script resumes from it safely.
+
+The system automatically creates (if missing) and updates the following columns:
+
+| Column | Description |
+|--------|-------------|
+| **ΕΛΛΑΔΑ** | The detected best price (€) from BestPrice.gr |
+| **GR_link** | Direct URL link to the matched product page on BestPrice |
+| **Σημειώσεις** | Processing status, extracted product volume normalized to milliliters (e.g. 700ml, 1000ml), similarity score, and diagnostic notes |
+
+---
+### 📝 Notes Column Details
+
+The **Σημειώσεις** column contains structured status messages such as:
+
+- `OK` → Valid match with sufficient similarity
+- `OK(short)` → Match found using short query fallback
+- `LOW_SIM` → Price found but similarity below threshold
+- `NONE` → No product match found
+- `TIMEOUT` → Network timeout occurred
+- `ERROR` → Unexpected error during processing
+
+This allows manual review of uncertain matches.
+
+---
+
+### 🔄 Smart Processing Logic
+
+- Rows that already contain a valid price are automatically skipped.
+- The file is auto-saved every 50 processed products.
+- If the script stops unexpectedly, it can safely resume.
+### 🔗 Product Link (GR_link)
+
+For every matched product, the script stores the **exact product page URL**.
+
+This allows:
+
+- Manual verification of price
+- Quick access to the source listing
+- Audit trail for data validation
+- Easy re-checking if prices change
+
+
