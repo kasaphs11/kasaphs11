@@ -39,6 +39,3 @@ If similarity is below threshold → marked as `LOW_SIM`.
 
 ---
 
-## 📊 Excel Integration
-
-Input file:
