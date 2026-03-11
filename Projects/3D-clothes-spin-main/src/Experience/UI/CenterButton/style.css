@@ -1,0 +1,66 @@
+.plus-overlay {
+    position: fixed;
+    top: 50%;
+    left: 20%;
+    transform: translate(-50%, -50%);
+    width: 30%;
+    height: 80%;
+    background-color: #685951;
+    border-radius: 10%;
+    display: none;
+    z-index: 9998;
+    opacity: 0;
+    animation: fadeIn 1s ease-in-out forwards;
+}
+
+.plus-overlay.show{
+    display: block;
+}
+
+.center-button {
+        position: fixed;
+        top: 15%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        width: 40px;
+        height: 40px;
+        background-color: white;
+        border: 2px solid black;
+        border-radius: 50%;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        cursor: pointer;
+        z-index: 9999;
+        opacity: 0;
+}
+
+.center-button .bar {
+        width: 12px;
+        height: 2px;
+        background-color: black;
+        position: absolute;
+}
+
+.center-button .bar::before{
+        content: '';
+        width: 12px;
+        height: 2px;
+        background-color: black;
+        position: absolute;
+}
+
+.center-button .bar::before {
+        top: 0px;
+        transform: rotate(90deg);
+}
+
+.center-button .bar::after {
+        bottom: -8px;
+}
+
+.container {
+    position: fixed;
+    top: 0%;
+    left: 10%;
+}

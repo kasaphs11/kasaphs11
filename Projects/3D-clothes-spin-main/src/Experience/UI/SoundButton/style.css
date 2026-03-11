@@ -1,0 +1,39 @@
+
+/* Style the sound-button */
+.sound-button {
+    width: 35px;
+    height: 35px;
+    color: black;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    border-radius: 50%;
+    border: none;
+    text-decoration: none;
+    transition: background 0.2s;
+}
+
+.sound-button:hover {
+    background-color: white;
+}
+
+/* Style the black line (initially hidden) */
+.bordered {
+    position: absolute;
+    top: 2px;
+    left: 18px;
+    width: 2px;
+    height: 90%;
+    background-color: black;
+    margin: 0;
+    padding: 0;
+    display: block;
+    transform: rotate(45deg);
+}
+
+/* Style the black line when the music-button is clicked */
+.sound-button.clicked + .bordered {
+    display: none;
+
+}
