@@ -31,12 +31,12 @@ except Exception:
 
 class BotManager:
     def __init__(self):
-        self.telegram_token = "8128037851:AAHJ60SfY2eOopopikpprsUGl_TPrP382lU"
+        self.telegram_token = ""
 
-        self.chat_id_1 = -1002572631109
-        self.chat_id_2 = -1002632958539
-        self.admin = 7862926827
-        self.chat_id_disconnected = -4636086214
+        self.chat_id_1 = 
+        self.chat_id_2 = 
+        self.admin = 
+        self.chat_id_disconnected = 
 
         with open("json/group_ids_betyz.json", "r", encoding="utf-8") as f:
             self.group_ids_betyz = json.load(f)["group_ids"]
